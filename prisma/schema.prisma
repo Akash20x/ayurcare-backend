@@ -1,0 +1,112 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  password  String
+  name      String
+  phone     String?  @unique
+  role      Role     @default(USER) 
+  otpVerifiedUntil DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  appointments Appointment[]
+
+  @@map("users")
+}
+
+enum ConsultationMode {
+  online
+  in_person
+  both
+}
+
+model Doctor {
+  id                String   @id @default(cuid())
+  name              String
+  email             String   @unique
+  phone             String?
+  specialization    String
+  consultationMode  ConsultationMode @default(online)
+  experience        Int      // years of experience
+  bio               String?
+  imageUrl          String?
+  isActive          Boolean  @default(true)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  // Relations
+  timeSlots    TimeSlot[]
+  appointments Appointment[]
+
+  @@map("doctors")
+}
+
+enum SlotStatus {
+  AVAILABLE
+  LOCKED
+  BOOKED
+}
+
+model TimeSlot {
+  id        String   @id @default(cuid())
+  doctorId  String
+  date      DateTime
+  startTime String   // Format: "HH:MM"
+  endTime   String   // Format: "HH:MM"
+  status    SlotStatus @default(AVAILABLE) // more flexible than isBooked
+  lockExpires DateTime?  // handle 5-min lock flow
+  lockedAt  DateTime?
+  lockedBy  String?  // User ID who locked the slot
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  doctor      Doctor       @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  appointments Appointment[]   // all appointments (booked + cancelled, rescheduled, etc.)
+
+  @@unique([doctorId, date, startTime])
+  @@map("time_slots")
+}
+
+enum AppointmentStatus {
+  BOOKED
+  COMPLETED
+  CANCELLED
+  RESCHEDULED
+}
+
+model Appointment {
+  id          String   @id @default(cuid())
+  userId      String
+  doctorId    String
+  timeSlotId  String? 
+  status      AppointmentStatus @default(BOOKED) 
+  notes       String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relations
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  doctor    Doctor    @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  timeSlot  TimeSlot? @relation(fields: [timeSlotId], references: [id], onDelete: Cascade)
+
+  @@map("appointments")
+}
