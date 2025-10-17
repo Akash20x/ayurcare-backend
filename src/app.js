@@ -14,7 +14,7 @@ const prisma = new PrismaClient();
 app.use(helmet());
 
 app.use(cors({
-  origin: 'http://localhost:3000', 
+  origin: 'ayurcare-web.vercel.app', 
   credentials: true
 }));
 
