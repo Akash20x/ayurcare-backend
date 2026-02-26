@@ -5,7 +5,7 @@ const cookieParser = require('cookie-parser');
 const morgan = require('morgan');
 const { PrismaClient } = require('@prisma/client');
 const { getDatabaseNow } = require('./utils/time');
-const cron = require('node-cron'); // ✅ use require here
+const cron = require('node-cron'); 
 
 const app = express();
 const prisma = new PrismaClient();
@@ -14,10 +14,9 @@ const prisma = new PrismaClient();
 app.use(helmet());
 
 app.use(cors({
-  origin: 'https://ayurcare-web.vercel.app', 
+  origin: process.env.ALLOWED_ORIGIN, 
   credentials: true
 }));
-
 
 app.use(morgan('combined'));
 app.use(express.json());
