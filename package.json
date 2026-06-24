@@ -6,11 +6,9 @@
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
-    "db:push": "prisma db push",
+    "postinstall": "prisma generate",
     "generate": "prisma generate",
     "studio": "prisma studio",
-    "db:seed": "prisma db seed",
-    "import:doctors": "node scripts/import-doctors.js",
     "test": "jest tests/unit"
   },
   "prisma": {
