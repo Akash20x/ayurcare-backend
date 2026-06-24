@@ -1,6 +1,17 @@
 const { PrismaClient } = require('@prisma/client');
-const { validateDoctorCreate, validateTimeSlotCreate, validateSlotsFetchQuery } = require('../utils/validation');
+const { validateDoctorCreate, validateTimeSlotCreate, validateBatchTimeSlotCreate, validateSlotsFetchQuery } = require('../utils/validation');
 const { getDatabaseNow, parseToMinutes, toTimeString } = require('../utils/time');
+const {
+  WEEKDAY_GROUPS,
+  getTodayUtc,
+  validateTimeframeRange,
+  buildTimeSegments,
+  getMatchingDatesInRange,
+  filterSchedulableDates,
+  formatDateYmd,
+  resolveBatchDateRange,
+  invalidateDoctorSlotCaches,
+} = require('../utils/timeSlotHelpers');
 const { 
   getNowUtc,
   getEarliestAvailableSlots,
@@ -396,6 +407,139 @@ try {
 };
 
 
+// Create 30-minute time slots across multiple days using a weekly day-group pattern
+const createBatchTimeSlot = async (req, res) => {
+  try {
+    const { doctorId } = req.params;
+    if (!doctorId) return res.status(400).json({ success: false, error: 'doctorId is required in path' });
+
+    const doctor = await prisma.doctor.findUnique({ where: { id: doctorId }, select: { id: true } });
+    if (!doctor) return res.status(404).json({ success: false, error: 'Doctor not found' });
+
+    const { error } = validateBatchTimeSlotCreate(req.body);
+    if (error) return res.status(400).json({ success: false, error: error.details[0].message });
+
+    const { scheduleType, group, startTime, endTime } = req.body;
+
+    const timeframe = validateTimeframeRange(startTime, endTime, parseToMinutes);
+    if (timeframe.error) {
+      return res.status(400).json({ success: false, error: timeframe.error });
+    }
+
+    const dateRange = resolveBatchDateRange(req.body.startDate, req.body.endDate);
+    const { startDate, endDate, parsedStartDate, parsedEndDate } = dateRange;
+
+    if (Number.isNaN(parsedStartDate.getTime()) || Number.isNaN(parsedEndDate.getTime())) {
+      return res.status(400).json({ success: false, error: 'Invalid startDate or endDate' });
+    }
+
+    const todayUTC = getTodayUtc();
+    if (parsedEndDate < todayUTC) {
+      return res.status(400).json({ success: false, error: 'Cannot create time slots for past dates' });
+    }
+
+    const weekdayNums = WEEKDAY_GROUPS[group];
+    const matchingDates = getMatchingDatesInRange(parsedStartDate, parsedEndDate, weekdayNums);
+    if (matchingDates.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'No matching days found for the selected group within the given date range',
+      });
+    }
+
+    const schedulableDates = filterSchedulableDates(matchingDates, timeframe.startMinutes);
+    if (schedulableDates.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'No schedulable dates remain after excluding past dates and times',
+      });
+    }
+
+    const segments = buildTimeSegments(timeframe.startMinutes, timeframe.endMinutes, toTimeString);
+
+    const conflicts = await prisma.timeSlot.findMany({
+      where: {
+        doctorId,
+        date: { in: schedulableDates },
+        startTime: { lt: endTime },
+        endTime: { gt: startTime },
+      },
+      select: { id: true, date: true, startTime: true, endTime: true },
+      orderBy: [{ date: 'asc' }, { startTime: 'asc' }],
+    });
+
+    if (conflicts.length > 0) {
+      return res.status(409).json({
+        success: false,
+        error: 'Requested timeframe overlaps with existing slots on one or more dates',
+        data: conflicts.map((slot) => ({
+          slotId: slot.id,
+          date: formatDateYmd(slot.date),
+          startTime: slot.startTime,
+          endTime: slot.endTime,
+        })),
+      });
+    }
+
+    const slotData = schedulableDates.flatMap((date) =>
+      segments.map((segment) => ({
+        doctorId,
+        date,
+        startTime: segment.startTime,
+        endTime: segment.endTime,
+      }))
+    );
+
+    await prisma.timeSlot.createMany({ data: slotData });
+
+    const createdSlots = await prisma.timeSlot.findMany({
+      where: {
+        doctorId,
+        date: { in: schedulableDates },
+        startTime: { in: segments.map((s) => s.startTime) },
+      },
+      select: { id: true, doctorId: true, date: true, startTime: true, endTime: true, status: true },
+      orderBy: [{ date: 'asc' }, { startTime: 'asc' }],
+    });
+
+    try {
+      await invalidateDoctorSlotCaches(redis, doctorId);
+    } catch (err) {
+      console.warn('Redis cache invalidation failed:', err.message);
+    }
+
+    return res.status(201).json({
+      success: true,
+      message: 'Batch time slots created successfully',
+      data: {
+        scheduleType,
+        group,
+        startDate,
+        endDate,
+        startTime,
+        endTime,
+        datesProcessed: schedulableDates.length,
+        slotsCreated: createdSlots.length,
+        slots: createdSlots.map((slot) => ({
+          slotId: slot.id,
+          doctorId: slot.doctorId,
+          date: formatDateYmd(slot.date),
+          startTime: slot.startTime,
+          endTime: slot.endTime,
+          status: slot.status,
+        })),
+      },
+    });
+  } catch (e) {
+    console.error('createBatchTimeSlot error:', e);
+    if (e.code === 'P2002') {
+      return res.status(409).json({ success: false, error: 'One or more slots already exist for this timeframe' });
+    }
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+
 // Fetch available (unbooked & unlocked) slots for a doctor on a given date or date range
 const getAvailableSlots = async (req, res) => {
   try {
@@ -687,7 +831,8 @@ module.exports = {
   createDoctor, 
   listDoctors, 
   getDoctorById, 
-  createTimeSlot, 
+  createTimeSlot,
+  createBatchTimeSlot,
   getAvailableSlots,
   lockTimeSlot,
   getSlotById

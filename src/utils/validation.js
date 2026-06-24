@@ -107,6 +107,52 @@ const validateTimeSlotCreate = (data) => {
   return schema.validate(data);
 };
 
+const BATCH_SLOT_GROUPS = [
+  'MON_WED_FRI',
+  'TUE_THU',
+  'TUE_THU_SAT',
+  'SAT_SUN',
+  'MON_TO_FRI',
+  'MON_TUE_WED',
+  'THU_FRI_SAT',
+];
+
+const validateBatchTimeSlotCreate = (data) => {
+  const timePattern = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
+  const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+
+  const schema = Joi.object({
+    scheduleType: Joi.string().valid('weekly').required(),
+    group: Joi.string()
+      .valid(...BATCH_SLOT_GROUPS)
+      .required()
+      .messages({ 'any.only': `group must be one of: ${BATCH_SLOT_GROUPS.join(', ')}` }),
+    startDate: Joi.string()
+      .pattern(datePattern)
+      .optional()
+      .messages({ 'string.pattern.base': 'startDate must be in YYYY-MM-DD format' }),
+    endDate: Joi.string()
+      .pattern(datePattern)
+      .optional()
+      .messages({ 'string.pattern.base': 'endDate must be in YYYY-MM-DD format' }),
+    startTime: Joi.string()
+      .pattern(timePattern)
+      .required()
+      .messages({ 'string.pattern.base': 'startTime must be in HH:MM (24h) format' }),
+    endTime: Joi.string()
+      .pattern(timePattern)
+      .required()
+      .messages({ 'string.pattern.base': 'endTime must be in HH:MM (24h) format' }),
+  }).custom((value, helpers) => {
+    if (value.startDate && value.endDate && value.startDate > value.endDate) {
+      return helpers.message('startDate must be on or before endDate');
+    }
+    return value;
+  });
+
+  return schema.validate(data);
+};
+
 const validateSlotsFetchQuery = (data) => {
   const schema = Joi.object({
     date: Joi.string()
@@ -138,6 +184,7 @@ module.exports = {
   validateRescheduleConfirm,
   validateDoctorCreate,
   validateTimeSlotCreate,
+  validateBatchTimeSlotCreate,
   validateSlotsFetchQuery
 };
 

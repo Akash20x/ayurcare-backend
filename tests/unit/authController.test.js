@@ -1,17 +1,14 @@
 const authController = require('../../src/controllers/authController');
 const validation = require('../../src/utils/validation');
-const { __prismaMock: prisma } = require('@prisma/client');
 
-// Mock Prisma
-jest.mock('@prisma/client', () => {
-  const prismaMock = {
-    user: {
-      findUnique: jest.fn(),
-      create: jest.fn(),
-    },
-  };
-  return { PrismaClient: jest.fn(() => prismaMock), __prismaMock: prismaMock };
-});
+jest.mock('../../src/lib/prisma', () => ({
+  user: {
+    findUnique: jest.fn(),
+    create: jest.fn(),
+    update: jest.fn(),
+  },
+}));
+const prisma = require('../../src/lib/prisma');
 
 // Mock validation
 jest.mock('../../src/utils/validation');

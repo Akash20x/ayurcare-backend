@@ -1,13 +1,5 @@
-const getDatabaseNow = async (prisma) => {
-  try {
-    const rows = await prisma.$queryRaw`SELECT NOW() as now`;
-    const row = Array.isArray(rows) ? rows[0] : rows;
-    const value = row?.now instanceof Date ? row.now : new Date(row?.now ?? Date.now());
-    return value;
-  } catch (_) {
-    return new Date();
-  }
-};
+// MongoDB does not support $queryRaw; use application time (UTC).
+const getDatabaseNow = async () => new Date();
 
 // Converts "HH:mm" → "hh:mm AM/PM"
 const formatTime = (time) => {

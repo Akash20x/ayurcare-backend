@@ -50,21 +50,34 @@ if (consultation_mode) {
     }
   }
 
-  // ✅ Specialization filter
+  // ✅ Specialization filter (MongoDB: case-sensitive contains)
   if (specialization) {
-    filters.specialization = {
-      contains: String(specialization),
-      mode: "insensitive",
-    };
+    filters.specialization = { contains: String(specialization) };
   }
 
-  // ✅ Search query filter
+  // ✅ Search query filter (MongoDB: case-sensitive contains)
   if (q) {
     const term = String(q);
+  
     filters.OR = [
-      { name: { contains: term, mode: "insensitive" } },
-      { specialization: { contains: term, mode: "insensitive" } },
-      { bio: { contains: term, mode: "insensitive" } },
+      {
+        name: {
+          contains: term,
+          mode: "insensitive",
+        },
+      },
+      {
+        specialization: {
+          contains: term,
+          mode: "insensitive",
+        },
+      },
+      {
+        bio: {
+          contains: term,
+          mode: "insensitive",
+        },
+      },
     ];
   }
 

@@ -1,19 +1,16 @@
 const doctorController = require('../../src/controllers/doctorController');
 const validation = require('../../src/utils/validation');
 
-jest.mock('@prisma/client', () => {
-  const prismaMock = {
-    doctor: {
-      create: jest.fn(),
-      findMany: jest.fn(),
-    },
-  };
-  return {
-    PrismaClient: jest.fn(() => prismaMock),
-    __prismaMock: prismaMock,
-  };
-});
-const { __prismaMock: prisma } = require('@prisma/client');
+jest.mock('../../src/lib/prisma', () => ({
+  doctor: {
+    create: jest.fn(),
+    findMany: jest.fn(),
+  },
+  timeSlot: {
+    findMany: jest.fn(),
+  },
+}));
+const prisma = require('../../src/lib/prisma');
 
 jest.mock('../../src/utils/validation');
 
