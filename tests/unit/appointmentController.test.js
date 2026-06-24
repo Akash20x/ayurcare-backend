@@ -4,33 +4,27 @@ jest.mock('../../src/utils/validation');
 jest.mock('../../src/utils/time', () => ({ getDatabaseNow: jest.fn() }));
 const { getDatabaseNow } = require('../../src/utils/time');
 
-jest.mock('@prisma/client', () => {
-  const prismaMock = {
-    timeSlot: {
-      findFirst: jest.fn(),
-      findUnique: jest.fn(),
-      updateMany: jest.fn(),
-      update: jest.fn(),
-    },
-    user: {
-      findUnique: jest.fn(),
-      update: jest.fn(),
-    },
-    appointment: {
-      findFirst: jest.fn(),
-      create: jest.fn(),
-      findMany: jest.fn(),
-      update: jest.fn(),
-      updateMany: jest.fn(),
-    },
-    $transaction: jest.fn(),
-  };
-  return {
-    PrismaClient: jest.fn(() => prismaMock),
-    __prismaMock: prismaMock,
-  };
-});
-const { __prismaMock: prisma } = require('@prisma/client');
+jest.mock('../../src/lib/prisma', () => ({
+  timeSlot: {
+    findFirst: jest.fn(),
+    findUnique: jest.fn(),
+    updateMany: jest.fn(),
+    update: jest.fn(),
+  },
+  user: {
+    findUnique: jest.fn(),
+    update: jest.fn(),
+  },
+  appointment: {
+    findFirst: jest.fn(),
+    create: jest.fn(),
+    findMany: jest.fn(),
+    update: jest.fn(),
+    updateMany: jest.fn(),
+  },
+  $transaction: jest.fn(),
+}));
+const prisma = require('../../src/lib/prisma');
 
 describe('appointmentController.confirmBooking', () => {
   let req, res;

@@ -1,19 +1,12 @@
 const auth = require('../../src/middleware/auth');
 const jwt = require('jsonwebtoken');
-const { PrismaClient } = require('@prisma/client');
 
-jest.mock('@prisma/client', () => {
-  const prismaMock = {
-    user: {
-      findUnique: jest.fn(),
-    },
-  };
-  return {
-    PrismaClient: jest.fn(() => prismaMock),
-    __prismaMock: prismaMock,
-  };
-});
-const { __prismaMock: prisma } = require('@prisma/client');
+jest.mock('../../src/lib/prisma', () => ({
+  user: {
+    findUnique: jest.fn(),
+  },
+}));
+const prisma = require('../../src/lib/prisma');
 jest.mock('jsonwebtoken');
 
 describe('auth middleware', () => {
