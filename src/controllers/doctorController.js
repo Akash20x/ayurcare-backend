@@ -1,5 +1,11 @@
-const { PrismaClient } = require('@prisma/client');
-const { validateDoctorCreate, validateTimeSlotCreate, validateBatchTimeSlotCreate, validateSlotsFetchQuery } = require('../utils/validation');
+const prisma = require('../lib/prisma');
+const {
+  validateDoctorCreate,
+  validateDoctorUpdate,
+  validateTimeSlotCreate,
+  validateBatchTimeSlotCreate,
+  validateSlotsFetchQuery,
+} = require('../utils/validation');
 const { getDatabaseNow, parseToMinutes, toTimeString } = require('../utils/time');
 const {
   WEEKDAY_GROUPS,
@@ -10,67 +16,72 @@ const {
   filterSchedulableDates,
   formatDateYmd,
   resolveBatchDateRange,
+  releaseExpiredLocks,
   invalidateDoctorSlotCaches,
 } = require('../utils/timeSlotHelpers');
-const { 
+const {
   getNowUtc,
   getEarliestAvailableSlots,
+  getEarliestFutureSlots,
   parseDoctorQuery,
   mapAndSortDoctorsByEarliestSlot,
-  sortByConsultationModePriority
-} = require("../utils/helper");
+} = require('../utils/helper');
 const redis = require('../lib/redisClient');
 
-const prisma = new PrismaClient();
-
-const selectDoctorFields = {
+const selectDoctorDetails = {
   id: true,
   name: true,
   email: true,
   phone: true,
   specialization: true,
   consultationMode: true,
+  consultationFee: true,
+  languages: true,
+  clinicName: true,
+  city: true,
   experience: true,
   bio: true,
   imageUrl: true,
 };
 
-// Add a new doctor 
+// The public directory also supplies the public profile pages. Keep the fields
+// those pages render, but never expose a doctor's contact details or unused
+// image URL in a list response.
+const selectDoctorListFields = {
+  id: true,
+  name: true,
+  specialization: true,
+  consultationMode: true,
+  consultationFee: true,
+  languages: true,
+  clinicName: true,
+  city: true,
+  experience: true,
+  bio: true,
+};
+
+const invalidateDoctorCaches = async (doctorId) => {
+  try {
+    await invalidateDoctorSlotCaches(redis, doctorId);
+  } catch (err) {
+    console.warn('Redis cache invalidation failed:', err.message);
+  }
+};
+
+// Add a new doctor
 const createDoctor = async (req, res) => {
   try {
     // Validate incoming request body
-    const { error } = validateDoctorCreate(req.body);
+    const { error, value } = validateDoctorCreate(req.body);
     if (error) return res.status(400).json({ success: false, error: error.details[0].message });
 
     // Create new doctor in the database
     const doctor = await prisma.doctor.create({
-      data: { ...req.body },
-      select: selectDoctorFields,
+      data: { ...(value || req.body), consultationMode: 'in_person' },
+      select: selectDoctorDetails,
     });
 
-    // Invalidate all cached doctor lists in Redis
-try {
-  let cursor = "0";
-  let deletedCount = 0;
-
-  do {
-    const [newCursor, keys] = await redis.scan(cursor, {
-      match: "doctors:list*",
-      count: 100,
-    });
-
-    cursor = newCursor;
-
-    if (keys.length > 0) {
-      const res = await redis.unlink(...keys);
-      deletedCount += res;
-    }
-  } while (cursor !== "0");
-
-} catch (err) {
-  console.warn("Redis cache invalidation failed:", err.message);
-}
-
+    await invalidateDoctorCaches(doctor.id);
 
     // Respond with created doctor data
     return res.status(201).json({
@@ -80,9 +91,48 @@ try {
     });
   } catch (e) {
     // Handle unique constraint violation (email)
-    if (e?.code === 'P2002') return res.status(409).json({ success: false, error: 'Doctor with this email already exists' });
+    if (e?.code === 'P2002')
+      return res
+        .status(409)
+        .json({ success: false, error: 'Doctor with this email already exists' });
 
     console.error('createDoctor error:', e);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+// Update an existing doctor
+const updateDoctor = async (req, res) => {
+  try {
+    const doctorId = req.params.id;
+
+    // Validate incoming request body
+    const { error, value } = validateDoctorUpdate(req.body);
+    if (error) return res.status(400).json({ success: false, error: error.details[0].message });
+
+    // Update doctor details in the database
+    const doctor = await prisma.doctor.update({
+      where: { id: doctorId },
+      data: { ...(value || req.body), consultationMode: 'in_person' },
+      select: selectDoctorDetails,
+    });
+
+    await invalidateDoctorCaches(doctor.id);
+
+    return res.json({
+      success: true,
+      message: 'Doctor updated successfully',
+      data: { doctor },
+    });
+  } catch (e) {
+    if (e?.code === 'P2025')
+      return res.status(404).json({ success: false, error: 'Doctor not found' });
+    if (e?.code === 'P2002')
+      return res
+        .status(409)
+        .json({ success: false, error: 'Doctor with this email already exists' });
+
+    console.error('updateDoctor error:', e);
     return res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };
@@ -95,130 +145,121 @@ const listDoctors = async (req, res) => {
 
     // ✅ Build cache key
     const normalizedFilters = JSON.stringify(filters);
-    const cacheKey = `doctors:list:${normalizedFilters}:page:${pagination.page}:${pagination.take}:${availableNormalized || "none"}`;
+    const cacheKey = `doctors:list:v3:${normalizedFilters}:page:${pagination.page}:${pagination.take}:${availableNormalized || 'none'}`;
 
-    const ttl = availableNormalized ? 30 : 3600;
+    // Availability is time-sensitive: a lock can expire between two requests.
+    // Do not serve an availability result from cache, otherwise an expired lock
+    // could remain hidden until the cache entry expires.
+    const shouldCache = availableNormalized !== 'earliest';
+    const ttl = 3600;
 
     // ✅ Try cache first
-    try {
-      const cached = await redis.get(cacheKey);
-      if (cached) {
-        return res.json(JSON.parse(cached));
+    if (shouldCache) {
+      try {
+        const cached = await redis.get(cacheKey);
+        if (cached) {
+          return res.json(JSON.parse(cached));
+        }
+      } catch (err) {
+        console.warn('Redis GET failed, continuing without cache:', err.message);
       }
-    } catch (err) {
-      console.warn("Redis GET failed, continuing without cache:", err.message);
     }
 
     // ✅ Case 1: Handle "earliest" availability first
-    if (availableNormalized === "earliest") {
+    if (availableNormalized === 'earliest') {
       const nowData = await getNowUtc(prisma);
-
-      // Step 1️⃣ - Get all available slots (future only)
-      const futureSlots = await prisma.timeSlot.findMany({
-        where: {
-          status: "AVAILABLE",
-          OR: [
-            { date: { gt: nowData.todayUtc } },
-            { AND: [{ date: nowData.todayUtc }, { startTime: { gt: nowData.currentHM } }] },
-          ],
-        },
-        select: { doctorId: true, date: true, startTime: true, endTime: true, id: true },
-        orderBy: [{ date: "asc" }, { startTime: "asc" }],
+      await releaseExpiredLocks(prisma, nowData.nowUtc, {
+        date: { gte: nowData.todayUtc },
       });
 
-      // Step 2️⃣ - Get unique earliest slot per doctor
-      const earliestByDoctor = new Map();
-      futureSlots.forEach((slot) => {
-        if (!earliestByDoctor.has(slot.doctorId)) earliestByDoctor.set(slot.doctorId, slot);
-      });
+      // MongoDB returns one earliest future slot per doctor, not every future slot.
+      const earliestByDoctor = await getEarliestFutureSlots(prisma, nowData);
 
       // Step 3️⃣ - Get doctor IDs who have slots
       const doctorIds = Array.from(earliestByDoctor.keys());
       if (doctorIds.length === 0) {
-        const response = { success: true, data: [], message: "No doctors with available slots found" };
-        try {
-          await redis.set(cacheKey, JSON.stringify(response), { EX: ttl });
-        } catch (err) {
-          console.warn("Redis SET failed 1:", err.message);
-        }
+        const response = {
+          success: true,
+          data: [],
+          currentPage: pagination.page,
+          pageSize: pagination.take,
+          totalPages: 0,
+          totalResults: 0,
+          message: 'No doctors with available slots found',
+        };
         return res.json(response);
       }
 
       // Step 4️⃣ - Apply search + filters ONLY on these doctors
-      const doctors = await prisma.doctor.findMany({
-        where: {
-          id: { in: doctorIds },
-          ...filters, // applies q, specialization, consultation_mode
-        },
-        select: selectDoctorFields,
-        skip: pagination.skip,
-        take: pagination.take,
-      });
+      const where = {
+        id: { in: doctorIds },
+        ...filters,
+      };
+      const [doctors, totalResults] = await Promise.all([
+        prisma.doctor.findMany({
+          where,
+          select: selectDoctorListFields,
+          skip: pagination.skip,
+          take: pagination.take,
+        }),
+        prisma.doctor.count({ where }),
+      ]);
 
       // Step 5️⃣ - Map and sort final list by earliest slot
       let result = mapAndSortDoctorsByEarliestSlot(doctors, earliestByDoctor);
 
-const consultation_mode = req.query.consultation_mode; // <-- ADD THIS
-
-
-      // Step 6 - Sort by consultation mode priority (online/in_person first)
-      result = sortByConsultationModePriority(result, consultation_mode);
-
       const response = {
         success: true,
         data: result,
-        message: "Doctors fetched successfully (sorted by earliest availability)",
+        currentPage: pagination.page,
+        pageSize: pagination.take,
+        totalPages: Math.ceil(totalResults / pagination.take),
+        totalResults,
+        message: 'Doctors fetched successfully (sorted by earliest availability)',
       };
 
-      try {
-        await redis.set(cacheKey, JSON.stringify(response), { EX: ttl });
-      } catch (err) {
-        console.warn("Redis SET failed 2:", err.message);
-      }
-
-      return res.json(response); 
+      return res.json(response);
     }
 
     // ✅ Case 2: Normal filters (no "earliest")
-    const doctors = await prisma.doctor.findMany({
-      where: filters,
-      select: selectDoctorFields,
-      skip: pagination.skip,
-      take: pagination.take,
-      orderBy: pagination.orderBy,
-    });
-
-    const consultation_mode = req.query.consultation_mode; // <-- ADD THIS
-
-        // ✅ Sort by consultation mode priority
-    const doctorsRes = sortByConsultationModePriority(doctors, consultation_mode);
+    const [doctors, totalResults] = await Promise.all([
+      prisma.doctor.findMany({
+        where: filters,
+        select: selectDoctorListFields,
+        skip: pagination.skip,
+        take: pagination.take,
+        orderBy: pagination.orderBy,
+      }),
+      prisma.doctor.count({ where: filters }),
+    ]);
 
     const response = {
       success: true,
-      data: doctorsRes,
-      message: "Doctors fetched successfully",
+      data: doctors,
+      currentPage: pagination.page,
+      pageSize: pagination.take,
+      totalPages: Math.ceil(totalResults / pagination.take),
+      totalResults,
+      message: 'Doctors fetched successfully',
     };
 
     try {
-      await redis.set(cacheKey, JSON.stringify(response), { EX: ttl });
+      await redis.set(cacheKey, JSON.stringify(response), { ex: ttl });
     } catch (err) {
-      console.warn("Redis SET failed 3:", err.message);
+      console.warn('Redis SET failed 3:', err.message);
     }
 
     return res.json(response);
   } catch (err) {
-    console.error("listDoctors error:", err);
+    console.error('listDoctors error:', err);
     return res.status(err.status || 500).json({
       success: false,
-      error: err.status ? err.message : "Internal server error",
+      error: err.status ? err.message : 'Internal server error',
     });
   }
 };
 
-
-
-
-// Get single doctor by ID 
+// Get single doctor by ID
 const getDoctorById = async (req, res) => {
   try {
     const doctorId = req.params.id;
@@ -232,41 +273,41 @@ const getDoctorById = async (req, res) => {
         return res.json(JSON.parse(cached)); // Return cached response
       }
     } catch (err) {
-      console.warn("Redis GET failed, fetching from DB:", err.message);
+      console.warn('Redis GET failed, fetching from DB:', err.message);
     }
 
     // Fetch doctor from DB if not cached
     const doctor = await prisma.doctor.findUnique({
       where: { id: doctorId },
-      select: selectDoctorFields,
+      select: selectDoctorDetails,
     });
 
     if (!doctor) {
       return res.status(404).json({
         success: false,
-        error: "Doctor not found",
+        error: 'Doctor not found',
       });
     }
 
     const response = {
       success: true,
       data: doctor,
-      message: "Doctor fetched successfully",
+      message: 'Doctor fetched successfully',
     };
 
     // Store fetched doctor in Redis cache
     try {
-      await redis.set(cacheKey, JSON.stringify(response), "EX", TTL);
+      await redis.set(cacheKey, JSON.stringify(response), { ex: TTL });
     } catch (err) {
-      console.warn("Redis SET failed:", err.message);
+      console.warn('Redis SET failed:', err.message);
     }
 
     return res.json(response);
   } catch (e) {
-    console.error("getDoctorById error:", e);
+    console.error('getDoctorById error:', e);
     return res.status(500).json({
       success: false,
-      error: "Internal server error",
+      error: 'Internal server error',
     });
   }
 };
@@ -274,12 +315,16 @@ const getDoctorById = async (req, res) => {
 // Create multiple 30-minute time slots for a doctor within a specified timeframe
 const createTimeSlot = async (req, res) => {
   try {
-    const { doctorId } = req.params; 
-    if (!doctorId) return res.status(400).json({ success: false, error: "doctorId is required in path" });
+    const { doctorId } = req.params;
+    if (!doctorId)
+      return res.status(400).json({ success: false, error: 'doctorId is required in path' });
 
     // Check if doctor exists
-    const doctor = await prisma.doctor.findUnique({ where: { id: doctorId }, select: { id: true } });
-    if (!doctor) return res.status(404).json({ success: false, error: "Doctor not found" });
+    const doctor = await prisma.doctor.findUnique({
+      where: { id: doctorId },
+      select: { id: true },
+    });
+    if (!doctor) return res.status(404).json({ success: false, error: 'Doctor not found' });
 
     // Validate request body
     const { error } = validateTimeSlotCreate(req.body);
@@ -292,16 +337,20 @@ const createTimeSlot = async (req, res) => {
 
     // Validate timeframe
     if (endMinutes <= startMinutes) {
-      return res.status(400).json({ success: false, error: "endTime must be greater than startTime" });
+      return res
+        .status(400)
+        .json({ success: false, error: 'endTime must be greater than startTime' });
     }
     if ((endMinutes - startMinutes) % 30 !== 0) {
-      return res.status(400).json({ success: false, error: "Timeframe must be a multiple of 30 minutes" });
+      return res
+        .status(400)
+        .json({ success: false, error: 'Timeframe must be a multiple of 30 minutes' });
     }
 
     // Parse date
     const parsedDate = new Date(`${date}T00:00:00.000Z`);
     if (Number.isNaN(parsedDate.getTime())) {
-      return res.status(400).json({ success: false, error: "Invalid date" });
+      return res.status(400).json({ success: false, error: 'Invalid date' });
     }
 
     // ✅ Prevent past dates & past times
@@ -310,14 +359,18 @@ const createTimeSlot = async (req, res) => {
     todayUTC.setUTCHours(0, 0, 0, 0);
 
     if (parsedDate < todayUTC) {
-      return res.status(400).json({ success: false, error: "Cannot create time slots for past dates" });
+      return res
+        .status(400)
+        .json({ success: false, error: 'Cannot create time slots for past dates' });
     }
 
     if (parsedDate.getTime() === todayUTC.getTime()) {
       // Today → ensure start time is in the future
       const nowMinutesUTC = now.getUTCHours() * 60 + now.getUTCMinutes();
       if (startMinutes <= nowMinutesUTC) {
-        return res.status(400).json({ success: false, error: "Cannot create time slots in the past for today" });
+        return res
+          .status(400)
+          .json({ success: false, error: 'Cannot create time slots in the past for today' });
       }
     }
 
@@ -332,7 +385,11 @@ const createTimeSlot = async (req, res) => {
       select: { id: true, startTime: true, endTime: true },
     });
     if (conflicts.length > 0) {
-      return res.status(409).json({ success: false, error: "Requested timeframe overlaps with existing slots", data: conflicts });
+      return res.status(409).json({
+        success: false,
+        error: 'Requested timeframe overlaps with existing slots',
+        data: conflicts,
+      });
     }
 
     // Generate 30-min segments
@@ -355,38 +412,13 @@ const createTimeSlot = async (req, res) => {
     const createdSlots = await prisma.timeSlot.findMany({
       where: { doctorId, date: parsedDate, startTime: { in: segments.map((s) => s.startTime) } },
       select: { id: true, doctorId: true, startTime: true, endTime: true, status: true },
-      orderBy: { startTime: "asc" },
+      orderBy: { startTime: 'asc' },
     });
-
-    // Invalidate relevant Redis caches
-try {
-  let cursor = "0";
-
-  do {
-    const [newCursor, keys] = await redis.scan(cursor, {
-      match: "doctors:list*",
-      count: 100,
-    });
-
-    cursor = newCursor ?? "0";
-
-    if (keys.length > 0) {
-      await redis.unlink(...keys);
-    }
-  } while (cursor !== "0");
-
-  // Delete individual doctor cache key if exists
-  const doctorCacheKey = `doctor:${doctorId}`;
-  await redis.unlink(doctorCacheKey);
-} catch (err) {
-  console.warn("Redis cache invalidation failed:", err.message);
-}
-
 
     // Return created slots
     return res.status(201).json({
       success: true,
-      message: "Time slots created successfully",
+      message: 'Time slots created successfully',
       data: createdSlots.map((slot) => ({
         slotId: slot.id,
         doctorId: slot.doctorId,
@@ -396,24 +428,28 @@ try {
         status: slot.status,
       })),
     });
-
   } catch (e) {
-    console.error("createTimeSlot error:", e);
-    if (e.code === "P2002") {
-      return res.status(409).json({ success: false, error: "One or more slots already exist for this timeframe" });
+    console.error('createTimeSlot error:', e);
+    if (e.code === 'P2002') {
+      return res
+        .status(409)
+        .json({ success: false, error: 'One or more slots already exist for this timeframe' });
     }
-    return res.status(500).json({ success: false, error: "Internal server error" });
+    return res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };
-
 
 // Create 30-minute time slots across multiple days using a weekly day-group pattern
 const createBatchTimeSlot = async (req, res) => {
   try {
     const { doctorId } = req.params;
-    if (!doctorId) return res.status(400).json({ success: false, error: 'doctorId is required in path' });
+    if (!doctorId)
+      return res.status(400).json({ success: false, error: 'doctorId is required in path' });
 
-    const doctor = await prisma.doctor.findUnique({ where: { id: doctorId }, select: { id: true } });
+    const doctor = await prisma.doctor.findUnique({
+      where: { id: doctorId },
+      select: { id: true },
+    });
     if (!doctor) return res.status(404).json({ success: false, error: 'Doctor not found' });
 
     const { error } = validateBatchTimeSlotCreate(req.body);
@@ -435,7 +471,9 @@ const createBatchTimeSlot = async (req, res) => {
 
     const todayUTC = getTodayUtc();
     if (parsedEndDate < todayUTC) {
-      return res.status(400).json({ success: false, error: 'Cannot create time slots for past dates' });
+      return res
+        .status(400)
+        .json({ success: false, error: 'Cannot create time slots for past dates' });
     }
 
     const weekdayNums = WEEKDAY_GROUPS[group];
@@ -498,15 +536,16 @@ const createBatchTimeSlot = async (req, res) => {
         date: { in: schedulableDates },
         startTime: { in: segments.map((s) => s.startTime) },
       },
-      select: { id: true, doctorId: true, date: true, startTime: true, endTime: true, status: true },
+      select: {
+        id: true,
+        doctorId: true,
+        date: true,
+        startTime: true,
+        endTime: true,
+        status: true,
+      },
       orderBy: [{ date: 'asc' }, { startTime: 'asc' }],
     });
-
-    try {
-      await invalidateDoctorSlotCaches(redis, doctorId);
-    } catch (err) {
-      console.warn('Redis cache invalidation failed:', err.message);
-    }
 
     return res.status(201).json({
       success: true,
@@ -533,12 +572,13 @@ const createBatchTimeSlot = async (req, res) => {
   } catch (e) {
     console.error('createBatchTimeSlot error:', e);
     if (e.code === 'P2002') {
-      return res.status(409).json({ success: false, error: 'One or more slots already exist for this timeframe' });
+      return res
+        .status(409)
+        .json({ success: false, error: 'One or more slots already exist for this timeframe' });
     }
     return res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };
-
 
 // Fetch available (unbooked & unlocked) slots for a doctor on a given date or date range
 const getAvailableSlots = async (req, res) => {
@@ -548,7 +588,7 @@ const getAvailableSlots = async (req, res) => {
 
     // required path param
     if (!doctorId) {
-      return res.status(400).json({ success: false, error: "doctorId is required in path" });
+      return res.status(400).json({ success: false, error: 'doctorId is required in path' });
     }
 
     // validate query params (expects validateSlotsFetchQuery to accept {date, start, end})
@@ -558,49 +598,71 @@ const getAvailableSlots = async (req, res) => {
     }
 
     // check doctor exists
-    const doctor = await prisma.doctor.findUnique({ where: { id: doctorId }, select: { id: true } });
+    const doctor = await prisma.doctor.findUnique({
+      where: { id: doctorId },
+      select: { id: true },
+    });
     if (!doctor) {
-      return res.status(404).json({ success: false, error: "Doctor not found" });
+      return res.status(404).json({ success: false, error: 'Doctor not found' });
     }
 
-    // current UTC date/time from DB 
+    // current UTC date/time from DB
     const nowUtc = await getDatabaseNow(prisma);
-    const todayUtc = new Date(Date.UTC(nowUtc.getUTCFullYear(), nowUtc.getUTCMonth(), nowUtc.getUTCDate()));
-    const todayStr = todayUtc.toISOString().split("T")[0];
-    const currentTimeStr = `${String(nowUtc.getUTCHours()).padStart(2, "0")}:${String(nowUtc.getUTCMinutes()).padStart(2, "0")}`;
+    const todayUtc = new Date(
+      Date.UTC(nowUtc.getUTCFullYear(), nowUtc.getUTCMonth(), nowUtc.getUTCDate())
+    );
+    const todayStr = todayUtc.toISOString().split('T')[0];
+    const currentTimeStr = `${String(nowUtc.getUTCHours()).padStart(2, '0')}:${String(nowUtc.getUTCMinutes()).padStart(2, '0')}`;
 
     // determine date range
     let startDate, endDate;
     if (date) {
       const parsed = new Date(`${date}T00:00:00.000Z`);
-      if (Number.isNaN(parsed.getTime())) return res.status(400).json({ success: false, error: "Invalid date" });
-      if (parsed < todayUtc) return res.status(400).json({ success: false, error: "date cannot be in the past" });
+      if (Number.isNaN(parsed.getTime()))
+        return res.status(400).json({ success: false, error: 'Invalid date' });
+      if (parsed < todayUtc)
+        return res.status(400).json({ success: false, error: 'date cannot be in the past' });
       startDate = parsed;
       endDate = parsed;
     } else {
       startDate = new Date(`${start}T00:00:00.000Z`);
       endDate = new Date(`${end}T00:00:00.000Z`);
       if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) {
-        return res.status(400).json({ success: false, error: "Invalid start or end date" });
+        return res.status(400).json({ success: false, error: 'Invalid start or end date' });
       }
-      if (startDate < todayUtc) return res.status(400).json({ success: false, error: "start cannot be in the past" });
-      if (endDate < startDate) return res.status(400).json({ success: false, error: "end cannot be before start" });
+      if (startDate < todayUtc)
+        return res.status(400).json({ success: false, error: 'start cannot be in the past' });
+      if (endDate < startDate)
+        return res.status(400).json({ success: false, error: 'end cannot be before start' });
     }
 
-    // fetch slots in one query (status = AVAILABLE)
+    await releaseExpiredLocks(prisma, nowUtc, {
+      doctorId,
+      date: { gte: startDate, lte: endDate },
+    });
+
+    // Expired locks were normalized above, so only physically available slots
+    // are returned to every calendar consumer.
     const slots = await prisma.timeSlot.findMany({
       where: {
         doctorId,
         date: { gte: startDate, lte: endDate },
-        status: "AVAILABLE",
+        status: 'AVAILABLE',
       },
-      select: { id: true, doctorId: true, date: true, startTime: true, endTime: true, status: true },
-      orderBy: [{ date: "asc" }, { startTime: "asc" }],
+      select: {
+        id: true,
+        doctorId: true,
+        date: true,
+        startTime: true,
+        endTime: true,
+        status: true,
+      },
+      orderBy: [{ date: 'asc' }, { startTime: 'asc' }],
     });
 
     // Filter out slots that already started today (only remove today's past slots)
     const filtered = slots.filter((slot) => {
-      const slotDateStr = slot.date.toISOString().split("T")[0];
+      const slotDateStr = slot.date.toISOString().split('T')[0];
       if (slotDateStr === todayStr) {
         return slot.startTime > currentTimeStr; // keep only future slots for today
       }
@@ -611,24 +673,22 @@ const getAvailableSlots = async (req, res) => {
     const data = filtered.map((slot) => ({
       slotId: slot.id,
       doctorId: slot.doctorId,
-      date: slot.date.toISOString().split("T")[0], // YYYY-MM-DD
+      date: slot.date.toISOString().split('T')[0], // YYYY-MM-DD
       startTime: slot.startTime,
       endTime: slot.endTime,
-      status: slot.status,
+      status: 'AVAILABLE',
     }));
 
     return res.json({
       success: true,
-      message: data.length > 0 ? "Available slots fetched successfully" : "No available slots",
+      message: data.length > 0 ? 'Available slots fetched successfully' : 'No available slots',
       data,
     });
   } catch (e) {
-    console.error("getAvailableSlots error:", e);
-    return res.status(500).json({ success: false, error: "Internal server error" });
+    console.error('getAvailableSlots error:', e);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };
-
-
 
 // Lock a doctor's time slot for 5 minutes by the authenticated user
 const lockTimeSlot = async (req, res) => {
@@ -640,52 +700,43 @@ const lockTimeSlot = async (req, res) => {
     if (!doctorId || !slotId) {
       return res.status(400).json({
         success: false,
-        error: "doctorId and slotId are required",
+        error: 'doctorId and slotId are required',
       });
     }
 
-    // Fetch the slot and ensure it belongs to the doctor
+    const nowUtc = await getDatabaseNow(prisma);
+    await releaseExpiredLocks(prisma, nowUtc, { id: slotId, doctorId });
+
+    // Fetch the slot after normalizing any expired locks for this doctor.
     const slot = await prisma.timeSlot.findFirst({
       where: { id: slotId, doctorId },
       select: { id: true, status: true, lockedBy: true, lockExpires: true },
     });
 
     if (!slot) {
-      return res.status(404).json({ success: false, error: "Time slot not found" });
+      return res.status(404).json({ success: false, error: 'Time slot not found' });
     }
 
     // Reject if slot is already booked
-    if (slot.status === "BOOKED") {
-      return res.status(409).json({ success: false, error: "Time slot already booked" });
+    if (slot.status === 'BOOKED') {
+      return res.status(409).json({ success: false, error: 'Time slot already booked' });
     }
 
-    if (slot.status === "LOCKED") {
-      return res.status(409).json({ success: false, error: "Time slot already locked" });
-    }
-
-    const nowUtc = await getDatabaseNow(prisma);
-
-    // Check if slot is currently locked by another user
-    const isLockedByOther =
-      slot.status === "LOCKED" &&
-      slot.lockedBy &&
-      slot.lockedBy !== userId &&
-      slot.lockExpires &&
-      slot.lockExpires > nowUtc;
-
-    if (isLockedByOther) {
-      return res.status(409).json({ success: false, error: "Time slot is temporarily locked" });
+    // A lock is active only until its expiry time. A missing expiry on a locked
+    // slot is treated as invalid state and is not claimable automatically.
+    if (slot.status === 'LOCKED' && (!slot.lockExpires || slot.lockExpires > nowUtc)) {
+      return res.status(409).json({ success: false, error: 'Time slot already locked' });
     }
 
     // Limit active locks per user (e.g., max 3)
     const activeLocks = await prisma.timeSlot.count({
-      where: { lockedBy: userId, status: "LOCKED", lockExpires: { gt: nowUtc } },
+      where: { lockedBy: userId, status: 'LOCKED', lockExpires: { gt: nowUtc } },
     });
 
     if (activeLocks >= 3) {
       return res.status(429).json({
         success: false,
-        error: "Lock limit reached. Complete or release existing locks.",
+        error: 'Lock limit reached. Complete or release existing locks.',
       });
     }
 
@@ -698,16 +749,12 @@ const lockTimeSlot = async (req, res) => {
       where: {
         id: slotId,
         doctorId,
-        OR: [
-          { status: "AVAILABLE" },
-          { lockedBy: userId },
-          { lockExpires: { lt: nowUtc } },
-        ],
+        OR: [{ status: 'AVAILABLE' }, { status: 'LOCKED', lockExpires: { lte: nowUtc } }],
       },
       data: {
-        status: "LOCKED",
+        status: 'LOCKED',
         lockedBy: userId,
-        lockedAt: nowUtc,       // ✅ Added to store when the lock was created
+        lockedAt: nowUtc, // ✅ Added to store when the lock was created
         lockExpires: expiresAt,
       },
     });
@@ -715,46 +762,27 @@ const lockTimeSlot = async (req, res) => {
     if (updateResult.count !== 1) {
       return res.status(409).json({
         success: false,
-        error: "Unable to lock slot. It may be locked or booked.",
+        error: 'Unable to lock slot. It may be locked or booked.',
       });
-    }
-
-    // Invalidate relevant Redis caches
-    try {
-      let cursor = "0";
-      do {
-        const result = await redis.scan(cursor, { match: "doctors:list:*", count: 100 });
-        cursor = result.cursor ?? "0";
-
-        if (result.keys.length > 0) {
-          await redis.unlink(...result.keys);
-        }
-      } while (cursor !== "0");
-
-      const doctorCacheKey = `doctor:${doctorId}`;
-      await redis.unlink(doctorCacheKey);
-    } catch (err) {
-      console.warn("Redis cache invalidation failed:", err.message);
     }
 
     // Respond with locked slot info
     return res.status(200).json({
       success: true,
-      message: "Slot locked",
+      message: 'Slot locked',
       data: {
         slotId,
         doctorId,
         lockedBy: userId,
-        lockedAt: nowUtc.toISOString(),   // ✅ Include lockedAt in response
+        lockedAt: nowUtc.toISOString(), // ✅ Include lockedAt in response
         expiresAt: expiresAt.toISOString(),
       },
     });
   } catch (e) {
-    console.error("lockTimeSlot error:", e);
-    return res.status(500).json({ success: false, error: "Internal server error" });
+    console.error('lockTimeSlot error:', e);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };
-
 
 // Fetch a specific time slot by doctor and slot ID, including doctor info
 const getSlotById = async (req, res) => {
@@ -765,11 +793,14 @@ const getSlotById = async (req, res) => {
     if (!doctorId || !slotId) {
       return res.status(400).json({
         success: false,
-        error: "doctorId and slotId are required in path",
+        error: 'doctorId and slotId are required in path',
       });
     }
 
-    // Fetch slot with related doctor info
+    const nowUtc = await getDatabaseNow(prisma);
+    await releaseExpiredLocks(prisma, nowUtc, { id: slotId, doctorId });
+
+    // Fetch slot after normalizing expired locks for this doctor.
     const slot = await prisma.timeSlot.findFirst({
       where: { id: slotId, doctorId },
       select: {
@@ -786,6 +817,10 @@ const getSlotById = async (req, res) => {
             name: true,
             specialization: true,
             consultationMode: true,
+            consultationFee: true,
+            languages: true,
+            clinicName: true,
+            city: true,
             experience: true,
           },
         },
@@ -796,18 +831,18 @@ const getSlotById = async (req, res) => {
     if (!slot) {
       return res.status(404).json({
         success: false,
-        error: "Slot not found",
+        error: 'Slot not found',
       });
     }
 
     // Prepare response with consistent lockExpires format
     return res.status(200).json({
       success: true,
-      message: "Slot fetched successfully",
+      message: 'Slot fetched successfully',
       data: {
         slotId: slot.id,
         doctorId: slot.doctorId,
-        date: slot.date.toISOString().split("T")[0],
+        date: slot.date.toISOString().split('T')[0],
         startTime: slot.startTime,
         endTime: slot.endTime,
         status: slot.status,
@@ -817,23 +852,22 @@ const getSlotById = async (req, res) => {
       },
     });
   } catch (e) {
-    console.error("getSlotById error:", e);
+    console.error('getSlotById error:', e);
     return res.status(500).json({
       success: false,
-      error: "Internal server error",
+      error: 'Internal server error',
     });
   }
 };
 
-
-
-module.exports = { 
-  createDoctor, 
-  listDoctors, 
-  getDoctorById, 
+module.exports = {
+  createDoctor,
+  updateDoctor,
+  listDoctors,
+  getDoctorById,
   createTimeSlot,
   createBatchTimeSlot,
   getAvailableSlots,
   lockTimeSlot,
-  getSlotById
- };
+  getSlotById,
+};

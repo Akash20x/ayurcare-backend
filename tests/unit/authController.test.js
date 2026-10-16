@@ -1,5 +1,6 @@
 const authController = require('../../src/controllers/authController');
 const validation = require('../../src/utils/validation');
+const jwt = require('jsonwebtoken');
 
 jest.mock('../../src/lib/prisma', () => ({
   user: {
@@ -9,6 +10,12 @@ jest.mock('../../src/lib/prisma', () => ({
   },
 }));
 const prisma = require('../../src/lib/prisma');
+
+jest.mock('../../src/lib/redisClient', () => ({
+  get: jest.fn().mockResolvedValue(null),
+  set: jest.fn().mockResolvedValue('OK'),
+  del: jest.fn().mockResolvedValue(1),
+}));
 
 // Mock validation
 jest.mock('../../src/utils/validation');
@@ -58,6 +65,42 @@ describe('Auth Controller', () => {
 
       expect(res.status).toHaveBeenCalledWith(400);
       expect(res.json).toHaveBeenCalledWith({ success: false, error: 'Invalid email or password' });
+    });
+  });
+
+  describe('getSession', () => {
+    it('returns the cookie-authenticated user in the session response shape', async () => {
+      const verify = jest.spyOn(jwt, 'verify').mockReturnValueOnce({ userId: 1 });
+      prisma.user.findUnique.mockResolvedValueOnce({
+        id: 1,
+        name: 'Test User',
+        email: 'test@example.com',
+        role: 'USER',
+      });
+
+      await authController.getSession({ cookies: { accessToken: 'signed-access-token' } }, res);
+
+      expect(res.json).toHaveBeenCalledWith({
+        success: true,
+        user: { id: 1, name: 'Test User', email: 'test@example.com', role: 'user' },
+      });
+      verify.mockRestore();
+    });
+
+    it('returns the unauthenticated response when the session cookie is missing', async () => {
+      await authController.getSession({ cookies: {} }, res);
+
+      expect(res.json).toHaveBeenCalledWith({ success: true, user: {} });
+    });
+
+    it('returns 401 with the same response body when a refresh cookie can renew the session', async () => {
+      const verify = jest.spyOn(jwt, 'verify').mockReturnValueOnce({ userId: 1 });
+
+      await authController.getSession({ cookies: { refreshToken: 'valid-refresh-token' } }, res);
+
+      expect(res.status).toHaveBeenCalledWith(401);
+      expect(res.json).toHaveBeenCalledWith({ success: false, user: {} });
+      verify.mockRestore();
     });
   });
 });

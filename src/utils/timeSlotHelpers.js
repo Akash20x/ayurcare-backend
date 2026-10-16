@@ -85,6 +85,24 @@ const resolveBatchDateRange = (startDate, endDate) => {
   };
 };
 
+const releaseExpiredLocks = async (prisma, now, scope = {}) => {
+  const where = {
+    status: 'LOCKED',
+    lockExpires: { lte: now },
+    ...scope,
+  };
+
+  return prisma.timeSlot.updateMany({
+    where,
+    data: {
+      status: 'AVAILABLE',
+      lockedBy: null,
+      lockedAt: null,
+      lockExpires: null,
+    },
+  });
+};
+
 const invalidateDoctorSlotCaches = async (redis, doctorId) => {
   let cursor = '0';
 
@@ -114,5 +132,6 @@ module.exports = {
   filterSchedulableDates,
   formatDateYmd,
   resolveBatchDateRange,
+  releaseExpiredLocks,
   invalidateDoctorSlotCaches,
 };

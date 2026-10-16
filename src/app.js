@@ -3,12 +3,13 @@ const cors = require('cors');
 const helmet = require('helmet');
 const cookieParser = require('cookie-parser');
 const morgan = require('morgan');
-const { PrismaClient } = require('@prisma/client');
 const { getDatabaseNow } = require('./utils/time');
+const { releaseExpiredLocks } = require('./utils/timeSlotHelpers');
 const cron = require('node-cron'); 
+const prisma = require('./lib/prisma');
+const cleanResponse = require('./middleware/cleanResponse');
 
 const app = express();
-const prisma = new PrismaClient();
 
 // Middleware
 app.use(helmet());
@@ -22,11 +23,14 @@ app.use(morgan('combined'));
 app.use(express.json());
 app.use(cookieParser()); 
 app.use(express.urlencoded({ extended: true }));
+app.use(cleanResponse);
 
 // Routes 
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/doctors', require('./routes/doctors'));
 app.use('/api/appointments', require('./routes/appointments'));
+app.use('/api/booking-drafts', require('./routes/bookingDrafts'));
+app.use('/api/admin', require('./routes/admin'));
 
 // Basic route
 app.get('/', (req, res) => {
@@ -49,30 +53,20 @@ app.use('*', (req, res) => {
   res.status(404).json({ error: 'Route not found' });
 });
 
-// Background job: release expired locks every 5 minutes
+// Releases expired slot locks every hour
 if (process.env.ENABLE_LOCK_CLEANUP === 'true') {
-  cron.schedule('*/5 * * * *', async () => {
+  cron.schedule('0 * * * *', async () => {
     try {
       const now = await getDatabaseNow(prisma);
+      const result = await releaseExpiredLocks(prisma, now);
 
-      await prisma.timeSlot.updateMany({
-        where: {
-          status: "LOCKED",
-          lockExpires: { lt: now }
-        },
-        data: {
-          status: "AVAILABLE",
-          lockedBy: null,
-          lockedAt: null,
-          lockExpires: null
-        }
-      });
-
-      console.log(`[CRON] Released expired locks at ${now.toISOString()}`);
+      if (result.count > 0) {
+        console.log(`[CRON] Released ${result.count} expired lock(s) at ${now.toISOString()}`);
+      }
     } catch (e) {
       console.error('[CRON] Lock cleanup job error:', e);
     }
-  });
+  }, { timezone: 'Asia/Kolkata' });
 }
 
 

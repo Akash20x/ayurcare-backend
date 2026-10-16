@@ -2,7 +2,7 @@ const { getDatabaseNow } = require("./time");
 
 const parseDoctorQuery = (query) => {
   const { page, consultation_mode, available, sortBy, specialization, q } = query;
-  const filters = {};
+  const filters = { consultationMode: 'in_person' };
   const errors = [];
 
   // ✅ Page validation
@@ -19,17 +19,10 @@ const parseDoctorQuery = (query) => {
     skip: (pageNum - 1) * take,
   };
 
-  // ✅ Consultation Mode
-if (consultation_mode) {
-  const validModes = ["online", "in_person", "both"];
-  if (!validModes.includes(consultation_mode)) {
-    errors.push({ status: 400, message: "Invalid consultation_mode. Use one of online, in_person, both." });
-  } else {
-    if (consultation_mode === "online") filters.consultationMode = { in: ["online", "both"] };
-    else if (consultation_mode === "in_person") filters.consultationMode = { in: ["in_person", "both"] };
-    else filters.consultationMode = { in: ["online", "in_person"] }; // both
+  // The public catalogue supports in-person consultations only.
+  if (consultation_mode && consultation_mode !== 'in_person') {
+    errors.push({ status: 400, message: 'Only in_person consultation_mode is supported.' });
   }
-}
 
 
   // ✅ Available filter
@@ -124,6 +117,64 @@ const getEarliestAvailableSlots = async (prisma, doctorIds, nowData) => {
   return earliestByDoctor;
 };
 
+const getEarliestFutureSlots = async (prisma, nowData) => {
+  const today = { $date: nowData.todayUtc.toISOString() };
+  try {
+    const rows = await prisma.timeSlot.aggregateRaw({
+      pipeline: [
+        {
+          $match: {
+            status: 'AVAILABLE',
+            $or: [
+              { date: { $gt: today } },
+              { date: today, startTime: { $gt: nowData.currentHM } },
+            ],
+          },
+        },
+        { $project: { _id: 1, doctorId: 1, date: 1, startTime: 1, endTime: 1 } },
+        { $sort: { date: 1, startTime: 1, _id: 1 } },
+        { $group: { _id: '$doctorId', slot: { $first: '$$ROOT' } } },
+        {
+          $project: {
+            _id: 0,
+            doctorId: { $toString: '$_id' },
+            slotId: { $toString: '$slot._id' },
+            date: { $dateToString: { format: '%Y-%m-%d', date: '$slot.date', timezone: 'UTC' } },
+            startTime: '$slot.startTime',
+            endTime: '$slot.endTime',
+          },
+        },
+      ],
+    });
+
+    return new Map(rows.map((row) => [row.doctorId, {
+      id: row.slotId,
+      date: row.date,
+      startTime: row.startTime,
+      endTime: row.endTime,
+    }]));
+  } catch (error) {
+    console.warn('Earliest-slot aggregation failed; using the Prisma query:', error.message);
+    const slots = await prisma.timeSlot.findMany({
+      where: {
+        status: 'AVAILABLE',
+        OR: [
+          { date: { gt: nowData.todayUtc } },
+          { AND: [{ date: nowData.todayUtc }, { startTime: { gt: nowData.currentHM } }] },
+        ],
+      },
+      select: { id: true, doctorId: true, date: true, startTime: true, endTime: true },
+      orderBy: [{ date: 'asc' }, { startTime: 'asc' }],
+    });
+
+    const earliestByDoctor = new Map();
+    for (const slot of slots) {
+      if (!earliestByDoctor.has(slot.doctorId)) earliestByDoctor.set(slot.doctorId, slot);
+    }
+    return earliestByDoctor;
+  }
+};
+
 const mapAndSortDoctorsByEarliestSlot = (doctors, earliestByDoctor) => {
   return doctors
     .map((doc) => {
@@ -156,18 +207,10 @@ const mapAndSortDoctorsByEarliestSlot = (doctors, earliestByDoctor) => {
     });
 };
 
-const sortByConsultationModePriority = (doctors, mode) => {
-  if (!mode) return doctors;
-  return doctors.sort((a, b) => {
-    const priority = (d) => (d.consultationMode === mode ? 0 : 1);
-    return priority(a) - priority(b);
-  });
-};
-
 module.exports = {
   parseDoctorQuery,
   getNowUtc,
   getEarliestAvailableSlots,
-  mapAndSortDoctorsByEarliestSlot,
-  sortByConsultationModePriority
+  getEarliestFutureSlots,
+  mapAndSortDoctorsByEarliestSlot
 };

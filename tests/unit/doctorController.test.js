@@ -4,13 +4,22 @@ const validation = require('../../src/utils/validation');
 jest.mock('../../src/lib/prisma', () => ({
   doctor: {
     create: jest.fn(),
+    update: jest.fn(),
     findMany: jest.fn(),
+    count: jest.fn(),
   },
   timeSlot: {
     findMany: jest.fn(),
   },
 }));
 const prisma = require('../../src/lib/prisma');
+
+jest.mock('../../src/lib/redisClient', () => ({
+  get: jest.fn().mockResolvedValue(null),
+  set: jest.fn().mockResolvedValue('OK'),
+  unlink: jest.fn().mockResolvedValue(0),
+  scan: jest.fn().mockResolvedValue(['0', []]),
+}));
 
 jest.mock('../../src/utils/validation');
 
@@ -25,7 +34,11 @@ describe('Doctor Controller', () => {
         email: 'drtest@example.com',
         phone: '1234567890',
         specialization: 'Cardiology',
-        consultationMode: 'online',
+        consultationMode: 'in_person',
+        consultationFee: 500,
+        languages: ['Hindi', 'English'],
+        clinicName: 'Ayurveda Wellness Clinic',
+        city: 'Jaipur',
         experience: 5,
         bio: 'Bio',
         imageUrl: 'img.jpg',
@@ -62,7 +75,7 @@ describe('Doctor Controller', () => {
       });
     });
 
-    it('returns 201 and doctor object on success', async () => {
+  it('returns 201 and doctor object on success', async () => {
       validation.validateDoctorCreate.mockReturnValueOnce({ error: null });
       prisma.doctor.create.mockResolvedValueOnce({
         id: 1,
@@ -72,7 +85,11 @@ describe('Doctor Controller', () => {
 
       await doctorController.createDoctor(req, res);
 
-      expect(prisma.doctor.create).toHaveBeenCalled();
+    expect(prisma.doctor.create).toHaveBeenCalled();
+    expect(prisma.doctor.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ consultationMode: 'in_person' }),
+      select: expect.objectContaining({ consultationFee: true, languages: true, clinicName: true, city: true }),
+    }));
       expect(res.status).toHaveBeenCalledWith(201);
       expect(res.json).toHaveBeenCalledWith({
         data: expect.any(Object),
@@ -92,6 +109,53 @@ describe('Doctor Controller', () => {
     });
   });
 
+  // ---------------- updateDoctor ----------------
+  describe('updateDoctor', () => {
+    it('returns 400 for invalid payload', async () => {
+      validation.validateDoctorUpdate.mockReturnValueOnce({
+        error: { details: [{ message: 'Invalid' }] },
+      });
+
+      await doctorController.updateDoctor({ params: { id: 'doctor-1' }, body: {} }, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith({ error: 'Invalid', success: false });
+    });
+
+    it('updates doctor details and clears doctor caches', async () => {
+      validation.validateDoctorUpdate.mockReturnValueOnce({ error: null, value: { clinicName: 'Ayurveda Wellness Clinic', city: 'Jaipur' } });
+      prisma.doctor.update.mockResolvedValueOnce({ id: 'doctor-1', clinicName: 'Ayurveda Wellness Clinic', city: 'Jaipur' });
+
+      await doctorController.updateDoctor({ params: { id: 'doctor-1' }, body: { clinicName: 'Ayurveda Wellness Clinic', city: 'Jaipur' } }, res);
+
+      expect(prisma.doctor.update).toHaveBeenCalledWith(expect.objectContaining({
+        where: { id: 'doctor-1' },
+        data: expect.objectContaining({
+          consultationMode: 'in_person',
+          clinicName: 'Ayurveda Wellness Clinic',
+          city: 'Jaipur',
+        }),
+      }));
+      expect(res.json).toHaveBeenCalledWith({
+        data: { doctor: expect.any(Object) },
+        message: 'Doctor updated successfully',
+        success: true,
+      });
+    });
+
+    it('returns 404 when doctor does not exist', async () => {
+      validation.validateDoctorUpdate.mockReturnValueOnce({ error: null, value: { languages: ['Hindi'] } });
+      const error = new Error('Doctor not found');
+      error.code = 'P2025';
+      prisma.doctor.update.mockImplementationOnce(() => { throw error; });
+
+      await doctorController.updateDoctor({ params: { id: 'doctor-1' }, body: { languages: ['Hindi'] } }, res);
+
+      expect(res.status).toHaveBeenCalledWith(404);
+      expect(res.json).toHaveBeenCalledWith({ error: 'Doctor not found', success: false });
+    });
+  });
+
   // ---------------- listDoctors ----------------
   describe('listDoctors', () => {
   beforeEach(() => {
@@ -100,9 +164,14 @@ describe('Doctor Controller', () => {
 
   it('returns list of doctors successfully', async () => {
     prisma.doctor.findMany.mockResolvedValueOnce([{ id: 1, name: 'Dr A' }]);
+    prisma.doctor.count.mockResolvedValueOnce(1);
     await doctorController.listDoctors(req, res);
     expect(res.json).toHaveBeenCalledWith({
       data: [{ id: 1, name: 'Dr A' }],
+      currentPage: 1,
+      pageSize: 8,
+      totalPages: 1,
+      totalResults: 1,
       message: 'Doctors fetched successfully',
       success: true,
     });
@@ -110,10 +179,15 @@ describe('Doctor Controller', () => {
 
 it('returns empty list when no doctors', async () => {
   prisma.doctor.findMany.mockResolvedValueOnce([]);
+  prisma.doctor.count.mockResolvedValueOnce(0);
   await doctorController.listDoctors(req, res);
 
   expect(res.json).toHaveBeenCalledWith({
     data: [],
+    currentPage: 1,
+    pageSize: 8,
+    totalPages: 0,
+    totalResults: 0,
     message: 'Doctors fetched successfully', // <-- updated
     success: true,
   });

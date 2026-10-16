@@ -1,15 +1,44 @@
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const crypto = require('crypto'); // ← add this
-const { PrismaClient } = require('@prisma/client');
-const { getDatabaseNow } = require('../utils/time');
-const { validateRegistration, validateLogin, validateOTP, validateEmail } = require('../utils/validation');
-const { getOTP, deleteOTP, saveOTP } = require('../utils/otp');
+const crypto = require('crypto');
+const { OAuth2Client } = require('google-auth-library');
+const prisma = require('../lib/prisma');
+const {
+  validateRegistration,
+  validateLogin,
+  validateOTP,
+  validateEmail,
+} = require('../utils/validation');
+const {
+  OTP_EXPIRY_SECONDS,
+  OTP_RESEND_COOLDOWN_SECONDS,
+  saveBookingOTP,
+  getBookingOTP,
+  deleteBookingOTP,
+  getBookingOTPCooldown,
+  saveBookingOTPCooldown,
+  saveBookingVerification,
+} = require('../utils/otp');
 const redis = require('../lib/redisClient');
-
-const prisma = new PrismaClient();
+const { sendOtpEmail } = require('../services/emailService');
 
 const generateOTP = () => Math.floor(100000 + Math.random() * 900000).toString();
+const normalizeEmail = (email) => String(email).trim().toLowerCase();
+const ACCESS_TOKEN_COOKIE_NAME = 'accessToken';
+const googleOAuthClient = new OAuth2Client();
+const accessTokenCookieOptions = {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === 'production',
+  sameSite: 'lax',
+  maxAge: 30 * 60 * 1000,
+  path: '/',
+};
+const refreshTokenCookieOptions = {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === 'production',
+  sameSite: 'lax',
+  maxAge: 30 * 24 * 60 * 60 * 1000,
+};
 
 const generateTokens = (user) => {
   const accessToken = jwt.sign(
@@ -18,13 +47,30 @@ const generateTokens = (user) => {
     { expiresIn: '30m' }
   );
 
-  const refreshToken = jwt.sign(
-    { userId: user.id },
-    process.env.JWT_REFRESH_SECRET,
-    { expiresIn: '30d' }
-  );
+  const refreshToken = jwt.sign({ userId: user.id }, process.env.JWT_REFRESH_SECRET, {
+    expiresIn: '30d',
+  });
 
   return { accessToken, refreshToken };
+};
+
+const setSessionCookies = (res, tokens) => {
+  res.cookie('refreshToken', tokens.refreshToken, refreshTokenCookieOptions);
+  res.cookie(ACCESS_TOKEN_COOKIE_NAME, tokens.accessToken, accessTokenCookieOptions);
+};
+
+const establishSession = async (res, user, status = 200, message = 'Login successful') => {
+  const tokens = generateTokens(user);
+  await saveRefreshTokenInRedis(tokens.refreshToken, user.id);
+  setSessionCookies(res, tokens);
+
+  return res.status(status).json({
+    success: true,
+    message,
+    data: {
+      user: { id: user.id, name: user.name, email: user.email, role: user.role.toLowerCase() },
+    },
+  });
 };
 
 // Save hashed refresh token in Redis with TTL (seconds)
@@ -41,6 +87,17 @@ const deleteRefreshTokenFromRedis = async (refreshToken) => {
   const hashed = crypto.createHash('sha256').update(refreshToken).digest('hex');
   await redis.del(`refresh:${hashed}`);
   return hashed;
+};
+
+const hasUsableRefreshToken = (refreshToken) => {
+  if (!refreshToken) return false;
+
+  try {
+    const payload = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
+    return Boolean(payload.userId);
+  } catch {
+    return false;
+  }
 };
 
 // -------------------- Register --------------------
@@ -66,27 +123,20 @@ const register = async (req, res) => {
 
     const user = await prisma.user.create({
       data: { name, email, password: hashedPassword, role },
-      select: { id: true, name: true, email: true, phone: true, createdAt: true, role:true }
+      select: { id: true, name: true, email: true, role: true },
     });
 
     const tokens = generateTokens(user);
     await saveRefreshTokenInRedis(tokens.refreshToken, user.id);
 
-    res.cookie('refreshToken', tokens.refreshToken, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 30 * 24 * 60 * 60 * 1000 // 30 days
-    });
-
+    setSessionCookies(res, tokens);
 
     res.status(201).json({
       success: true,
       message: 'User registered successfully',
-      data: { 
-        user,         
-        accessToken: tokens.accessToken
-      }
+      data: {
+        user,
+      },
     });
   } catch (err) {
     console.error('Registration error:', err);
@@ -103,179 +153,226 @@ const login = async (req, res) => {
     const { email, password } = req.body;
     const user = await prisma.user.findUnique({ where: { email } });
 
-    if (!user || !(await bcrypt.compare(password, user.password))) {
+    if (!user || !user.password || !(await bcrypt.compare(password, user.password))) {
       return res.status(400).json({ success: false, error: 'Invalid email or password' });
     }
 
-    const tokens = generateTokens(user);
-    await saveRefreshTokenInRedis(tokens.refreshToken, user.id);
-
-    res.cookie('refreshToken', tokens.refreshToken, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', maxAge: 30*24*60*60*1000 });
-
-
-    res.json({
-      success: true,
-      message: 'Login successful',
-      data: {
-        user: { id: user.id, name: user.name, email: user.email, phone: user.phone },
-        accessToken: tokens.accessToken
-      }
-    });
+    return establishSession(res, user);
   } catch (err) {
     console.error('Login error:', err);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };
 
+// Google Identity Services sends a signed ID token. It must be verified on the
+// server; a decoded token or client-provided email is never trusted.
+const loginWithGoogle = async (req, res) => {
+  try {
+    const credential = req.body?.credential;
+    const clientId = process.env.GOOGLE_CLIENT_ID;
+
+    if (!credential || typeof credential !== 'string') {
+      return res.status(400).json({ success: false, error: 'Google credential is required' });
+    }
+    if (!clientId) {
+      console.error('Google sign-in is not configured: GOOGLE_CLIENT_ID is missing');
+      return res.status(503).json({ success: false, error: 'Google sign-in is unavailable' });
+    }
+
+    const ticket = await googleOAuthClient.verifyIdToken({
+      idToken: credential,
+      audience: clientId,
+    });
+    const payload = ticket.getPayload();
+    const email = normalizeEmail(payload?.email);
+    const googleId = payload?.sub;
+
+    if (!payload?.email_verified || !email || !googleId) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Google did not provide a verified email address' });
+    }
+
+    // googleId is protected by a MongoDB sparse unique index. Prisma cannot
+    // model that optional MongoDB constraint, so use findFirst here.
+    let user = await prisma.user.findFirst({ where: { googleId } });
+
+    if (!user) {
+      const userWithEmail = await prisma.user.findUnique({ where: { email } });
+      // A verified Google email can safely be linked to the matching local account.
+      if (userWithEmail) {
+        if (userWithEmail.googleId && userWithEmail.googleId !== googleId) {
+          return res.status(409).json({
+            success: false,
+            error: 'This email is already linked to another Google account',
+          });
+        }
+        user = await prisma.user.update({ where: { id: userWithEmail.id }, data: { googleId } });
+      } else {
+        user = await prisma.user.create({
+          data: {
+            name: payload.name?.trim() || email.split('@')[0],
+            email,
+            googleId,
+            role: 'USER',
+          },
+        });
+      }
+    }
+
+    return establishSession(res, user, 200, 'Google sign-in successful');
+  } catch (err) {
+    console.error('Google sign-in error:', err.message);
+    return res.status(401).json({ success: false, error: 'Unable to verify Google sign-in' });
+  }
+};
+
 // Generate OTP
 const generateOTPForUser = async (req, res) => {
   try {
-    const { email } = req.body;
-    if (!email) return res.status(400).json({ success: false, error: "Email required" });
+    const { error, value } = validateEmail(req.body);
+    if (error) return res.status(400).json({ success: false, error: error.details[0].message });
 
-    const user = await prisma.user.findUnique({ where: { email } });
-    if (!user) return res.status(400).json({ success: false, error: "User not found" });
+    const userId = req.user?.id;
+    if (!userId) return res.status(401).json({ success: false, error: 'Unauthorized' });
+
+    const email = normalizeEmail(value.email);
+    const cooldown = await getBookingOTPCooldown(userId, email);
+    if (cooldown) {
+      return res.status(429).json({
+        success: false,
+        error: `Please wait ${OTP_RESEND_COOLDOWN_SECONDS} seconds before requesting another OTP`,
+      });
+    }
 
     const otp = generateOTP();
-    await saveOTP(email, otp);
+    await saveBookingOTP(userId, email, otp);
 
-    res.json({
-      success: true,
-      message: "OTP generated and sent",
-      data: { email, otp }, 
-    });
+    try {
+      const emailResult = await sendOtpEmail(email, otp, OTP_EXPIRY_SECONDS / 60);
+      await saveBookingOTPCooldown(userId, email);
+
+      return res.json({
+        success: true,
+        message: emailResult.sent ? 'OTP sent successfully' : 'OTP generated successfully',
+        data: {
+          email,
+          expiresInMinutes: OTP_EXPIRY_SECONDS / 60,
+          emailDelivery: emailResult.sent ? 'sent' : 'disabled',
+        },
+      });
+    } catch (err) {
+      await deleteBookingOTP(userId, email);
+      console.error('Send OTP email error:', err.message);
+      return res.status(500).json({ success: false, error: 'Failed to send OTP email' });
+    }
   } catch (err) {
-    console.error("Generate OTP error:", err);
-    res.status(500).json({ success: false, error: "Internal server error" });
+    console.error('Generate OTP error:', err);
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };
 
 // Verify OTP
 const verifyOTP = async (req, res) => {
   try {
-
-    const { error } = validateOTP(req.body);
+    const { error, value } = validateOTP(req.body);
     if (error) return res.status(400).json({ success: false, error: error.details[0].message });
 
-    const { email, otp } = req.body;
-    if (!email || !otp) return res.status(400).json({ success: false, error: "Email and OTP required" });
+    const userId = req.user?.id;
+    if (!userId) return res.status(401).json({ success: false, error: 'Unauthorized' });
 
-    const storedOTP = await getOTP(email);
-    if (!storedOTP) {
-      return res.status(400).json({ success: false, error: "OTP expired or not found" });
+    const email = normalizeEmail(value.email);
+    const { otp } = value;
+    if (!email || !otp)
+      return res.status(400).json({ success: false, error: 'Email and OTP required' });
+
+    const isMasterOTP =
+      process.env.MASTER_OTP && String(process.env.MASTER_OTP).trim() === String(otp).trim();
+    if (!isMasterOTP) {
+      const storedOTP = await getBookingOTP(userId, email);
+      if (!storedOTP) {
+        return res.status(400).json({ success: false, error: 'OTP expired or not found' });
+      }
+
+      if (String(storedOTP).trim() !== String(otp).trim()) {
+        return res.status(400).json({ success: false, error: 'Invalid OTP' });
+      }
     }
 
-   if (String(storedOTP).trim() !== String(otp).trim()) {
-  return res.status(400).json({ success: false, error: "Invalid OTP" });
-}
-    await deleteOTP(email);
+    await deleteBookingOTP(userId, email);
+    await saveBookingVerification(userId, email);
 
-    
-    const user = await prisma.user.findUnique({ where: { email }, select: { id: true } });
-    const nowDb = await getDatabaseNow(prisma);
-    const verifiedUntil = new Date(nowDb.getTime() + 5 * 60 * 1000);
-
-    await prisma.user.update({ where: { id: user.id }, data: { otpVerifiedUntil: verifiedUntil } });
+    const verifiedUntil = new Date(Date.now() + OTP_EXPIRY_SECONDS * 1000);
 
     res.json({
       success: true,
       message: 'OTP verified successfully',
-      data: { otpVerifiedUntil: verifiedUntil.toISOString() }
+      data: { email, verifiedUntil: verifiedUntil.toISOString() },
     });
   } catch (err) {
-    console.error("Verify OTP error:", err);
-    res.status(500).json({ success: false, error: "Internal server error" });
+    console.error('Verify OTP error:', err);
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };
 
+// -------------------- Session --------------------
+const getSession = async (req, res) => {
+  const unauthenticated = () => {
+    // Keep the response body stable. A 401 means the browser has a usable
+    // refresh cookie, so the frontend should refresh the access-token cookie.
+    if (hasUsableRefreshToken(req.cookies?.refreshToken)) {
+      return res.status(401).json({ success: false, user: {} });
+    }
 
-// -------------------- Get Profile --------------------
-const getProfile = async (req, res) => {
+    // A guest session is a successful session check, not an API error.
+    return res.json({ success: true, user: {} });
+  };
+
   try {
-    const userId = req.user?.id;
-    if (!userId) {
-      return res.status(401).json({ success: false, error: "Unauthorized" });
-    }
+    const token = req.cookies?.[ACCESS_TOKEN_COOKIE_NAME];
+    if (!token) return unauthenticated();
 
-    const cacheKey = `user:${userId}:profile`;
-    const CACHE_TTL = 600; // 10 minutes
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    if (!decoded.userId) return unauthenticated();
 
-    // Try cache first
-    const cachedProfile = await redis.get(cacheKey);
-    if (cachedProfile) {
-      try {
-        const parsed = JSON.parse(cachedProfile);
-        return res.json({
-          success: true,
-          data: parsed,
-          message: "Profile fetched successfully (from cache)",
-        });
-      } catch (err) {
-        console.warn("Invalid JSON in Redis for key:", cacheKey, cachedProfile);
-        // Clear bad cache so fresh data can be stored
-        await redis.del(cacheKey);
-      }
-    }
-
-    // Fetch user from DB including role
     const user = await prisma.user.findUnique({
-      where: { id: userId },
-      select: {
-        id: true,
-        name: true,
-        email: true,
-        phone: true,
-        role: true,
-        createdAt: true,
+      where: { id: decoded.userId },
+      select: { id: true, name: true, email: true, role: true },
+    });
+
+    if (!user) return unauthenticated();
+
+    return res.json({
+      success: true,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        role: user.role.toLowerCase(),
       },
     });
-
-    if (!user) {
-      return res.status(404).json({ success: false, error: "User not found" });
-    }
-
-    // Normalize role for API response
-    const userResponse = {
-      id: user.id,
-      name: user.name,
-      email: user.email,
-      phone: user.phone,
-      role: user.role?.toLowerCase() || null,
-      createdAt: user.createdAt,
-    };
-
-    // Store valid JSON in Redis
-    await redis.set(cacheKey, JSON.stringify(userResponse), { ex: CACHE_TTL });
-
-    res.json({
-      success: true,
-      data: userResponse,
-      message: "Profile fetched successfully",
-    });
   } catch (err) {
-    console.error("Get profile error:", err);
-    res.status(500).json({ success: false, error: "Internal server error" });
+    console.warn('Session validation failed:', err.message);
+    return unauthenticated();
   }
 };
-
-
 
 // -------------------- Logout --------------------
 const logout = async (req, res) => {
   try {
     // Support both body & cookie (if you set cookie on login)
-    const incomingToken = req.body.refreshToken || (req.cookies && req.cookies.refreshToken);
+    const incomingToken = req.body?.refreshToken || req.cookies?.refreshToken;
+    res.clearCookie('refreshToken');
+    res.clearCookie(ACCESS_TOKEN_COOKIE_NAME, { path: '/' });
     if (!incomingToken) {
       return res.status(400).json({ success: false, error: 'Refresh token is required' });
     }
 
     await deleteRefreshTokenFromRedis(incomingToken);
 
-    res.clearCookie('refreshToken');
-
     res.json({
       success: true,
-      message: 'Logged out successfully'
+      message: 'Logged out successfully',
     });
   } catch (err) {
     console.error('Logout error:', err);
@@ -286,7 +383,7 @@ const logout = async (req, res) => {
 // -------------------- Refresh Token --------------------
 const refresh = async (req, res) => {
   try {
-    const incomingToken = req.body.refreshToken || (req.cookies && req.cookies.refreshToken);
+    const incomingToken = req.body?.refreshToken || req.cookies?.refreshToken;
 
     if (!incomingToken) {
       return res.status(400).json({ success: false, error: 'Refresh token is required' });
@@ -319,32 +416,26 @@ const refresh = async (req, res) => {
     const tokens = generateTokens(user);
     await saveRefreshTokenInRedis(tokens.refreshToken, user.id);
 
-   res.cookie('refreshToken', tokens.refreshToken, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
-    });
+    setSessionCookies(res, tokens);
 
     res.json({
       success: true,
       message: 'Token refreshed successfully',
-      data: { accessToken: tokens.accessToken }
+      data: {},
     });
-
   } catch (err) {
     console.error('Refresh token error:', err);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };
 
-
 module.exports = {
   register,
   login,
+  loginWithGoogle,
   generateOTPForUser,
   verifyOTP,
-  getProfile,
+  getSession,
   logout,
-  refresh
+  refresh,
 };

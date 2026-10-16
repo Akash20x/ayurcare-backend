@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const auth = require('../middleware/auth');
-const { createDoctor, listDoctors, getDoctorById, createTimeSlot, createBatchTimeSlot, getAvailableSlots, lockTimeSlot, getSlotById } = require('../controllers/doctorController');
+const { createDoctor, updateDoctor, listDoctors, getDoctorById, createTimeSlot, createBatchTimeSlot, getAvailableSlots, lockTimeSlot, getSlotById } = require('../controllers/doctorController');
 const adminAuth = require('../middleware/adminAuth');
 
 // Public: Get all doctors based on filters
@@ -12,6 +12,9 @@ router.get('/:id', getDoctorById);
 
 // Protected: Create a doctor
 router.post('/', auth, adminAuth, createDoctor);
+
+// Protected: Update a doctor
+router.put('/:id', auth, adminAuth, updateDoctor);
 
 // Protected: Create a time slot for a doctor
 router.post('/:doctorId/slots', auth, adminAuth, createTimeSlot);

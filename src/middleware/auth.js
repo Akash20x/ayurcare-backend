@@ -1,11 +1,10 @@
 const jwt = require('jsonwebtoken');
-const { PrismaClient } = require('@prisma/client');
-
-const prisma = new PrismaClient();
+const prisma = require('../lib/prisma');
 
 const auth = async (req, res, next) => {
   try {
-    const token = req.header('Authorization')?.replace('Bearer ', '');
+    const bearerToken = req.header('Authorization')?.replace('Bearer ', '');
+    const token = bearerToken || req.cookies?.accessToken;
     
     if (!token) {
       return res.status(401).json({ success: false, error: 'Access denied. No token provided.' });
@@ -14,7 +13,7 @@ const auth = async (req, res, next) => {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     const user = await prisma.user.findUnique({
       where: { id: decoded.userId },
-      select: { id: true, email: true, name: true, phone: true }
+      select: { id: true, email: true, name: true, phone: true, role: true }
     });
 
     if (!user) {

@@ -45,7 +45,50 @@ const validateAppointment = (data) => {
   const schema = Joi.object({
     doctorId: Joi.string().required(),
     timeSlotId: Joi.string().required(),
-    notes: Joi.string().max(500).optional()
+    contactEmail: Joi.string().email().required(),
+    notes: Joi.string().max(500).optional(),
+    patient: Joi.object({
+      name: Joi.string().trim().min(2).max(100).required(),
+      age: Joi.number().integer().min(0).max(130).required(),
+      gender: Joi.string().valid('male', 'female', 'other').insensitive().required(),
+      phone: Joi.string().trim().pattern(/^[0-9+()\-\s]{7,20}$/).required()
+    }).optional()
+  });
+  return schema.validate(data);
+};
+
+const validateBookingDraft = (data) => {
+  const patientSchema = Joi.object({
+    name: Joi.string().trim().min(2).max(100).required(),
+    age: Joi.number().integer().min(0).max(130).optional(),
+    gender: Joi.string().valid('male', 'female', 'other').insensitive().optional(),
+    phone: Joi.string().trim().pattern(/^[0-9+()\-\s]{7,20}$/).optional()
+  });
+
+  const schema = Joi.object({
+    doctorId: Joi.string().required(),
+    timeSlotId: Joi.string(),
+    slotId: Joi.string(),
+    contactEmail: Joi.string().email().required(),
+    notes: Joi.string().max(500).optional(),
+    consultationMode: Joi.string().valid('in_person').optional(),
+    bookingForSomeoneElse: Joi.boolean().default(false),
+    patient: patientSchema.required()
+  }).or('timeSlotId', 'slotId');
+  return schema.validate(data);
+};
+
+const validateBookingDraftId = (data) => {
+  const schema = Joi.object({
+    draftId: Joi.string().trim().required()
+  });
+  return schema.validate(data);
+};
+
+const validateBookingDraftOTP = (data) => {
+  const schema = Joi.object({
+    draftId: Joi.string().trim().required(),
+    otp: Joi.string().length(6).pattern(/^[0-9]+$/).required()
   });
   return schema.validate(data);
 };
@@ -80,11 +123,40 @@ const validateDoctorCreate = (data) => {
     email: Joi.string().email().required(),
     phone: Joi.string().max(20).allow(null, ''),
     specialization: Joi.string().min(2).max(100).required(),
-    consultationMode: Joi.string().valid('online', 'in_person', 'both').required(),
+    consultationMode: Joi.string().valid('in_person').default('in_person'),
+    consultationFee: Joi.number().integer().min(0).max(100000).default(500),
+    languages: Joi.array()
+      .items(Joi.string().trim().min(2).max(50))
+      .min(1)
+      .max(10)
+      .default(['Hindi', 'English']),
+    clinicName: Joi.string().trim().min(2).max(150).allow(null, ''),
+    city: Joi.string().trim().min(2).max(100).allow(null, ''),
     experience: Joi.number().integer().min(0).max(80).required(),
     bio: Joi.string().max(2000).allow(null, ''),
     imageUrl: Joi.string().uri().allow(null, '')
   });
+  return schema.validate(data);
+};
+
+const validateDoctorUpdate = (data) => {
+  const schema = Joi.object({
+    name: Joi.string().min(2).max(100),
+    email: Joi.string().email(),
+    phone: Joi.string().max(20).allow(null, ''),
+    specialization: Joi.string().min(2).max(100),
+    consultationMode: Joi.string().valid('in_person'),
+    consultationFee: Joi.number().integer().min(0).max(100000),
+    languages: Joi.array()
+      .items(Joi.string().trim().min(2).max(50))
+      .min(1)
+      .max(10),
+    clinicName: Joi.string().trim().min(2).max(150).allow(null, ''),
+    city: Joi.string().trim().min(2).max(100).allow(null, ''),
+    experience: Joi.number().integer().min(0).max(80),
+    bio: Joi.string().max(2000).allow(null, ''),
+    imageUrl: Joi.string().uri().allow(null, '')
+  }).min(1);
   return schema.validate(data);
 };
 
@@ -179,10 +251,14 @@ module.exports = {
   validateOTP,
   validateSlotLock,
   validateAppointment,
+  validateBookingDraft,
+  validateBookingDraftId,
+  validateBookingDraftOTP,
   validateAppointmentStatusUpdate,
   validateAppointmentReschedule,
   validateRescheduleConfirm,
   validateDoctorCreate,
+  validateDoctorUpdate,
   validateTimeSlotCreate,
   validateBatchTimeSlotCreate,
   validateSlotsFetchQuery

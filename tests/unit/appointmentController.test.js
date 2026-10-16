@@ -4,6 +4,17 @@ jest.mock('../../src/utils/validation');
 jest.mock('../../src/utils/time', () => ({ getDatabaseNow: jest.fn() }));
 const { getDatabaseNow } = require('../../src/utils/time');
 
+jest.mock('../../src/utils/otp', () => ({
+  getBookingVerification: jest.fn(),
+  deleteBookingVerification: jest.fn(),
+}));
+const { getBookingVerification } = require('../../src/utils/otp');
+
+jest.mock('../../src/services/emailService', () => ({
+  sendAppointmentConfirmation: jest.fn(),
+}));
+const { sendAppointmentConfirmation } = require('../../src/services/emailService');
+
 jest.mock('../../src/lib/prisma', () => ({
   timeSlot: {
     findFirst: jest.fn(),
@@ -14,6 +25,9 @@ jest.mock('../../src/lib/prisma', () => ({
   user: {
     findUnique: jest.fn(),
     update: jest.fn(),
+  },
+  doctor: {
+    findUnique: jest.fn(),
   },
   appointment: {
     findFirst: jest.fn(),
@@ -26,13 +40,30 @@ jest.mock('../../src/lib/prisma', () => ({
 }));
 const prisma = require('../../src/lib/prisma');
 
+jest.mock('../../src/lib/redisClient', () => ({
+  get: jest.fn().mockResolvedValue(null),
+  set: jest.fn().mockResolvedValue('OK'),
+  del: jest.fn().mockResolvedValue(1),
+  smembers: jest.fn().mockResolvedValue([]),
+  expire: jest.fn().mockResolvedValue(1),
+}));
+
 describe('appointmentController.confirmBooking', () => {
   let req, res;
   beforeEach(() => {
-    req = { body: { doctorId: 1, timeSlotId: 2, notes: 'note' }, user: { id: 10 } };
+    req = { body: { doctorId: 1, timeSlotId: 2, contactEmail: 'patient@example.com', notes: 'note' }, user: { id: 10 } };
     res = { status: jest.fn().mockReturnThis(), json: jest.fn() };
     jest.clearAllMocks();
     getDatabaseNow.mockResolvedValue(new Date(Date.now() + 60000));
+    getBookingVerification.mockResolvedValue(true);
+    sendAppointmentConfirmation.mockResolvedValue({ sent: true });
+    prisma.doctor.findUnique.mockResolvedValue({
+      id: 1,
+      name: 'Dr. Test',
+      specialization: 'General Medicine',
+      consultationMode: 'in_person',
+      consultationFee: 500,
+    });
   });
 
   it('returns 400 for invalid payload', async () => {
@@ -69,7 +100,7 @@ describe('appointmentController.confirmBooking', () => {
   it('returns 403 if OTP not verified', async () => {
     validation.validateAppointment.mockReturnValueOnce({ error: null, value: req.body });
     prisma.timeSlot.findUnique.mockResolvedValueOnce({ id: 2, doctorId: 1, status: 'LOCKED', lockedBy: 10, lockExpires: new Date(Date.now() + 60000) });
-    prisma.user.findUnique.mockResolvedValueOnce({ otpVerifiedUntil: null });
+    getBookingVerification.mockResolvedValueOnce(false);
     await appointmentController.confirmBooking(req, res);
     expect(res.status).toHaveBeenCalledWith(403);
     expect(res.json).toHaveBeenCalledWith({
@@ -84,7 +115,6 @@ describe('appointmentController.confirmBooking', () => {
     const nowUtc = new Date('2025-09-02T12:00:00Z');
     getDatabaseNow.mockResolvedValueOnce(nowUtc);
     prisma.timeSlot.findUnique.mockResolvedValueOnce({ id: 2, doctorId: 1, status: 'LOCKED', lockedBy: 99, lockExpires: new Date('2025-09-02T12:10:00Z') });
-    prisma.user.findUnique.mockResolvedValueOnce({ otpVerifiedUntil: new Date('2025-09-02T12:10:00Z') });
     await appointmentController.confirmBooking(req, res);
     expect(res.status).toHaveBeenCalledWith(409);
     expect(res.json).toHaveBeenCalledWith({
@@ -103,7 +133,6 @@ describe('appointmentController.confirmBooking', () => {
       date: new Date(now.getTime() + 86400000),
       startTime: '23:59'
     });
-    prisma.user.findUnique.mockResolvedValueOnce({ otpVerifiedUntil: new Date(now.getTime() + 60000) });
     prisma.timeSlot.updateMany.mockResolvedValueOnce({ count: 1 });
     prisma.appointment.findFirst.mockResolvedValueOnce(null);
     prisma.appointment.create.mockResolvedValueOnce({ id: 123 });
@@ -114,7 +143,7 @@ describe('appointmentController.confirmBooking', () => {
     expect(res.json).toHaveBeenCalledWith({
       success: true,
       message: 'Appointment booked successfully',
-      data: { id: 123 }
+      data: { id: 123, emailDelivery: 'sent' }
     });
   });
 
@@ -127,7 +156,6 @@ describe('appointmentController.confirmBooking', () => {
       date: new Date(now.getTime() + 86400000),
       startTime: '23:59'
     });
-    prisma.user.findUnique.mockResolvedValueOnce({ otpVerifiedUntil: new Date(now.getTime() + 60000) });
     prisma.timeSlot.updateMany.mockResolvedValueOnce({ count: 0 });
     prisma.$transaction.mockImplementationOnce(async () => { throw { code: 'CONFLICT_SLOT_STATE', message: 'Slot state changed, try again' }; });
     await appointmentController.confirmBooking(req, res);
@@ -147,7 +175,6 @@ describe('appointmentController.confirmBooking', () => {
       date: new Date(now.getTime() - 86400000),
       startTime: '10:00'
     });
-    prisma.user.findUnique.mockResolvedValueOnce({ otpVerifiedUntil: new Date(now.getTime() + 60000) });
     prisma.timeSlot.updateMany.mockResolvedValueOnce({ count: 1 });
     prisma.$transaction.mockImplementationOnce(async () => { throw { code: 'SLOT_IN_PAST', message: 'Cannot book a past date slot' }; });
     await appointmentController.confirmBooking(req, res);
@@ -167,7 +194,6 @@ describe('appointmentController.confirmBooking', () => {
       date: new Date(now.getTime() + 86400000),
       startTime: '23:59'
     });
-    prisma.user.findUnique.mockResolvedValueOnce({ otpVerifiedUntil: new Date(now.getTime() + 60000) });
     prisma.timeSlot.updateMany.mockResolvedValueOnce({ count: 1 });
     prisma.$transaction.mockImplementationOnce(() => { throw new Error('DB error'); });
     await appointmentController.confirmBooking(req, res);
