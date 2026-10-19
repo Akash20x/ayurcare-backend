@@ -26,17 +26,18 @@ const generateOTP = () => Math.floor(100000 + Math.random() * 900000).toString()
 const normalizeEmail = (email) => String(email).trim().toLowerCase();
 const ACCESS_TOKEN_COOKIE_NAME = 'accessToken';
 const googleOAuthClient = new OAuth2Client();
+const isProduction = process.env.NODE_ENV === 'production';
 const accessTokenCookieOptions = {
   httpOnly: true,
-  secure: process.env.NODE_ENV === 'production',
-  sameSite: 'lax',
+  secure: isProduction,
+  sameSite: isProduction ? 'none' : 'lax',
   maxAge: 30 * 60 * 1000,
   path: '/',
 };
 const refreshTokenCookieOptions = {
   httpOnly: true,
-  secure: process.env.NODE_ENV === 'production',
-  sameSite: 'lax',
+  secure: isProduction,
+  sameSite: isProduction ? 'none' : 'lax',
   maxAge: 30 * 24 * 60 * 60 * 1000,
 };
 
