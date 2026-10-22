@@ -86,11 +86,32 @@ const parseDoctorQuery = (query) => {
 };
 
 
-const getNowUtc = async (prisma) => {
+// Slot dates are calendar dates and slot times are India-local wall-clock times.
+// Keep this aligned with the admin upcoming-slots query so both surfaces agree
+// on whether a same-day slot is still bookable.
+const getNowInIndia = async (prisma) => {
   const nowUtc = await getDatabaseNow(prisma);
-  const todayUtc = new Date(Date.UTC(nowUtc.getUTCFullYear(), nowUtc.getUTCMonth(), nowUtc.getUTCDate()));
-  const currentHM = `${String(nowUtc.getUTCHours()).padStart(2, "0")}:${String(nowUtc.getUTCMinutes()).padStart(2, "0")}`;
-  return { nowUtc, todayUtc, currentHM };
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  })
+    .formatToParts(nowUtc)
+    .reduce((result, part) => {
+      if (part.type !== 'literal') result[part.type] = part.value;
+      return result;
+    }, {});
+
+  return {
+    nowUtc,
+    // Dates are stored as UTC midnight, while representing an Indian calendar date.
+    todayUtc: new Date(Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day))),
+    currentHM: `${parts.hour}:${parts.minute}`,
+  };
 };
 
 const getEarliestAvailableSlots = async (prisma, doctorIds, nowData) => {
@@ -209,7 +230,7 @@ const mapAndSortDoctorsByEarliestSlot = (doctors, earliestByDoctor) => {
 
 module.exports = {
   parseDoctorQuery,
-  getNowUtc,
+  getNowInIndia,
   getEarliestAvailableSlots,
   getEarliestFutureSlots,
   mapAndSortDoctorsByEarliestSlot

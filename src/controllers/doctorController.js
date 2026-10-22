@@ -20,7 +20,7 @@ const {
   invalidateDoctorSlotCaches,
 } = require('../utils/timeSlotHelpers');
 const {
-  getNowUtc,
+  getNowInIndia,
   getEarliestAvailableSlots,
   getEarliestFutureSlots,
   parseDoctorQuery,
@@ -167,7 +167,7 @@ const listDoctors = async (req, res) => {
 
     // ✅ Case 1: Handle "earliest" availability first
     if (availableNormalized === 'earliest') {
-      const nowData = await getNowUtc(prisma);
+      const nowData = await getNowInIndia(prisma);
       await releaseExpiredLocks(prisma, nowData.nowUtc, {
         date: { gte: nowData.todayUtc },
       });
@@ -195,18 +195,17 @@ const listDoctors = async (req, res) => {
         id: { in: doctorIds },
         ...filters,
       };
-      const [doctors, totalResults] = await Promise.all([
-        prisma.doctor.findMany({
-          where,
-          select: selectDoctorListFields,
-          skip: pagination.skip,
-          take: pagination.take,
-        }),
-        prisma.doctor.count({ where }),
-      ]);
+      // Fetch every matching candidate before pagination. Paginating first would
+      // sort only an arbitrary subset of doctors, rather than the full ranked list.
+      const doctors = await prisma.doctor.findMany({
+        where,
+        select: selectDoctorListFields,
+      });
 
-      // Step 5️⃣ - Map and sort final list by earliest slot
-      let result = mapAndSortDoctorsByEarliestSlot(doctors, earliestByDoctor);
+      // Step 5️⃣ - Rank all matching doctors, then paginate the ranked result.
+      const rankedDoctors = mapAndSortDoctorsByEarliestSlot(doctors, earliestByDoctor);
+      const totalResults = rankedDoctors.length;
+      const result = rankedDoctors.slice(pagination.skip, pagination.skip + pagination.take);
 
       const response = {
         success: true,

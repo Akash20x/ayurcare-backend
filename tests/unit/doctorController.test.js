@@ -10,6 +10,8 @@ jest.mock('../../src/lib/prisma', () => ({
   },
   timeSlot: {
     findMany: jest.fn(),
+    aggregateRaw: jest.fn(),
+    updateMany: jest.fn(),
   },
 }));
 const prisma = require('../../src/lib/prisma');
@@ -192,6 +194,41 @@ it('returns empty list when no doctors', async () => {
     success: true,
   });
 }, 10000);
+
+  it('ranks every matching doctor before returning the first Explore page', async () => {
+    req.query = { available: 'earliest', page: '1' };
+    const doctors = [
+      { id: 'ananya', name: 'Dr Ananya' },
+      { id: 'arvind', name: 'Dr Arvind' },
+      ...Array.from({ length: 7 }, (_, index) => ({ id: `doctor-${index}`, name: `Dr ${index}` })),
+    ];
+    prisma.timeSlot.aggregateRaw.mockResolvedValueOnce([
+      { doctorId: 'ananya', slotId: 'slot-ananya', date: '2099-01-02', startTime: '10:00', endTime: '10:30' },
+      { doctorId: 'arvind', slotId: 'slot-arvind', date: '2099-01-01', startTime: '09:00', endTime: '09:30' },
+      ...Array.from({ length: 7 }, (_, index) => ({
+        doctorId: `doctor-${index}`,
+        slotId: `slot-${index}`,
+        date: '2099-01-03',
+        startTime: '09:00',
+        endTime: '09:30',
+      })),
+    ]);
+    prisma.doctor.findMany.mockResolvedValueOnce(doctors);
+
+    await doctorController.listDoctors(req, res);
+
+    expect(prisma.doctor.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ id: { in: expect.arrayContaining(['arvind', 'ananya']) } }),
+      select: expect.any(Object),
+    }));
+    expect(prisma.doctor.findMany.mock.calls[0][0]).not.toHaveProperty('skip');
+    expect(prisma.doctor.findMany.mock.calls[0][0]).not.toHaveProperty('take');
+
+    const response = res.json.mock.calls[0][0];
+    expect(response.totalResults).toBe(9);
+    expect(response.data).toHaveLength(8);
+    expect(response.data.slice(0, 2).map((doctor) => doctor.id)).toEqual(['arvind', 'ananya']);
+  });
 
 
   it('returns 500 on DB error', async () => {
