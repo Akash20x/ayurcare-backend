@@ -26,7 +26,7 @@ describe('Auth Controller', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     req = { body: { name: 'Test', email: 'test@example.com', password: 'pass123' } };
-    res = { status: jest.fn().mockReturnThis(), json: jest.fn() };
+    res = { status: jest.fn().mockReturnThis(), json: jest.fn(), clearCookie: jest.fn() };
   });
 
   describe('register', () => {
@@ -101,6 +101,22 @@ describe('Auth Controller', () => {
       expect(res.status).toHaveBeenCalledWith(401);
       expect(res.json).toHaveBeenCalledWith({ success: false, user: {} });
       verify.mockRestore();
+    });
+  });
+
+  describe('logout', () => {
+    it('clears both session cookies with the same attributes used for session cookies', async () => {
+      await authController.logout({ body: {}, cookies: { refreshToken: 'refresh-token' } }, res);
+
+      const expectedOptions = {
+        httpOnly: true,
+        secure: false,
+        sameSite: 'lax',
+        path: '/',
+      };
+      expect(res.clearCookie).toHaveBeenCalledWith('refreshToken', expectedOptions);
+      expect(res.clearCookie).toHaveBeenCalledWith('accessToken', expectedOptions);
+      expect(res.json).toHaveBeenCalledWith({ success: true, message: 'Logged out successfully' });
     });
   });
 });

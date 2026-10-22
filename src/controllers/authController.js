@@ -39,6 +39,13 @@ const refreshTokenCookieOptions = {
   secure: isProduction,
   sameSite: isProduction ? 'none' : 'lax',
   maxAge: 30 * 24 * 60 * 60 * 1000,
+  path: '/',
+};
+const sessionCookieClearOptions = {
+  httpOnly: true,
+  secure: isProduction,
+  sameSite: isProduction ? 'none' : 'lax',
+  path: '/',
 };
 
 const generateTokens = (user) => {
@@ -363,8 +370,11 @@ const logout = async (req, res) => {
   try {
     // Support both body & cookie (if you set cookie on login)
     const incomingToken = req.body?.refreshToken || req.cookies?.refreshToken;
-    res.clearCookie('refreshToken');
-    res.clearCookie(ACCESS_TOKEN_COOKIE_NAME, { path: '/' });
+    // Cookie deletion must use the same cross-site attributes as creation.
+    // Otherwise browsers can retain the production SameSite=None session
+    // cookie, which restores the user on the next page load.
+    res.clearCookie('refreshToken', sessionCookieClearOptions);
+    res.clearCookie(ACCESS_TOKEN_COOKIE_NAME, sessionCookieClearOptions);
     if (!incomingToken) {
       return res.status(400).json({ success: false, error: 'Refresh token is required' });
     }

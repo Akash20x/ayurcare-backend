@@ -23,6 +23,7 @@ app.use(morgan('combined'));
 app.use(express.json());
 app.use(cookieParser()); 
 app.use(express.urlencoded({ extended: true }));
+app.use(cleanResponse);
 
 // Routes 
 app.use('/api/auth', require('./routes/auth'));
@@ -35,8 +36,6 @@ app.use('/api/admin', require('./routes/admin'));
 app.get('/', (req, res) => {
   res.json({ message: 'Ayurcare API is running!' });
 });
-
-app.use(cleanResponse);
 
 // Health check route
 app.get('/api/health', (req, res) => {
